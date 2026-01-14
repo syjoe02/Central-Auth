@@ -1,0 +1,33 @@
+# ===== Go =====
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go build cache
+/bin/
+build/
+dist/
+
+# Go workspace cache
+/pkg/
+*.log
+
+# Go module cache (보통 git에 안 올림)
+vendor/
+
+# ===== Environment =====
+.env
+
+# ===== IDE / Editor =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*.DS_Store
+
+# ===== Docker =====
+docker-data/
