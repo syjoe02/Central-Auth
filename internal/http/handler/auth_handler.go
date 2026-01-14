@@ -23,7 +23,12 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	access, refresh, err := h.authService.Login(req.UserID, req.DeviceID)
+	if req.DeviceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "device_id is required"})
+		return
+	}
+
+	access, refresh, err := h.authService.Login(req.UserID, req.DeviceID, req.RememberMe,)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
