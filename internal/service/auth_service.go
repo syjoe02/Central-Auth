@@ -3,6 +3,7 @@ package service
 import (
 	"central-auth/internal/repository"
 	"central-auth/internal/token"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,19 +12,19 @@ import (
 const (
 	AccessTokenTTL  = time.Minute * 15
 	RefreshTTLShort = time.Hour * 24 * 7
-	RefreshTTLLong  = time.Hour * 24 * 30 
+	RefreshTTLLong  = time.Hour * 24 * 30
 )
 
 type AuthService struct {
-	redisRepo *repository.RedisRepository
+	redisRepo    *repository.RedisRepository
 	authUserRepo repository.AuthUserRepository
 }
 
 func NewAuthService(
 	redisRepo *repository.RedisRepository,
 	authUserRepo repository.AuthUserRepository,
-	) *AuthService {
-	return &AuthService{redisRepo: redisRepo, authUserRepo: authUserRepo,}
+) *AuthService {
+	return &AuthService{redisRepo: redisRepo, authUserRepo: authUserRepo}
 }
 
 // accessToken : 15min, refreshToken : 7 days, rememberMe : 30 days
@@ -59,7 +60,6 @@ func (s *AuthService) OAuthLogin(
 	rememberMe bool,
 ) (string, string, error) {
 
-	// 1. Central-Auth DB에서 내부 userId 조회 or 생성
 	user, err := s.authUserRepo.FindByProvider(provider, providerUserID)
 	if err != nil {
 		user = &repository.AuthUser{
@@ -98,4 +98,53 @@ func (s *AuthService) OAuthLogin(
 	}
 
 	return accessToken, refreshToken, nil
+}
+
+func (s *AuthService) Logout(accessToken string) error {
+	claims, err := token.Parse(accessToken)
+	if err != nil {
+		return err
+	}
+
+	if claims.UserID == "" || claims.DeviceID == "" {
+		return errors.New("missing claims")
+	}
+	return s.redisRepo.LogoutDevice(claims.UserID, claims.DeviceID)
+}
+
+func (s *AuthService) LogoutAll(accessToken string) error {
+	claims, err := token.Parse(accessToken)
+	if err != nil {
+		return err
+	}
+
+	if claims.UserID == "" {
+		return errors.New("missing user_id")
+	}
+	return s.redisRepo.LogoutAll(claims.UserID)
+}
+
+func (s *AuthService) Refresh(refreshToken string) (string, error) {
+	claims, err := token.Parse(refreshToken)
+	if err != nil {
+		return "", err
+	}
+
+	userID := claims.UserID
+	deviceID := claims.DeviceID
+
+	exists, err := s.redisRepo.ExistsRefreshToken(userID, deviceID)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", errors.New("refresh token expired or revoked")
+	}
+
+	newAccessToken, err := token.Generate(userID, deviceID, AccessTokenTTL)
+	if err != nil {
+		return "", err
+	}
+
+	return newAccessToken, nil
 }

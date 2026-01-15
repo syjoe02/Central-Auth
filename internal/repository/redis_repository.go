@@ -82,3 +82,47 @@ func (r *RedisRepository) SaveLogin(userID, deviceID, refreshToken string, ttl t
 
 	return nil
 }
+
+func (r *RedisRepository) ExistsRefreshToken(userID, deviceID string) (bool, error) {
+	ctx := config.Ctx
+	key := "auth:refresh:" + userID + ":" + deviceID
+	cnt, err := r.client.Exists(ctx, key).Result()
+
+	if err != nil {
+		return false, err
+	}
+	return cnt == 1, nil
+}
+
+func (r *RedisRepository) LogoutDevice(userID, deviceID string) error {
+	ctx := config.Ctx
+	dKey := devicesKey(userID)
+	rKey := refreshKey(userID, deviceID)
+
+	pipe := r.client.TxPipeline()
+	pipe.Del(ctx, rKey)
+	pipe.ZRem(ctx, dKey, deviceID)
+
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+func (r *RedisRepository) LogoutAll(userID string) error {
+	ctx := config.Ctx
+	dKey := devicesKey(userID)
+
+	devicesIDs, err := r.client.ZRange(ctx, dKey, 0, -1).Result()
+	if err != nil {
+		return err
+	}
+
+	pipe := r.client.TxPipeline()
+
+	for _, deviceID := range devicesIDs {
+		pipe.Del(ctx, refreshKey(userID, deviceID))
+	}
+
+	pipe.Del(ctx, dKey)
+	_, err = pipe.Exec(ctx)
+	return err
+}

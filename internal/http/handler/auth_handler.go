@@ -4,6 +4,7 @@ import (
 	"central-auth/internal/model"
 	"central-auth/internal/service"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -14,6 +15,18 @@ type AuthHandler struct {
 
 func NewAuthHandler(authService *service.AuthService) *AuthHandler {
 	return &AuthHandler{authService: authService}
+}
+
+func bearerToken(c *gin.Context) (string, bool) {
+	h := c.GetHeader("Authorization")
+	if h == "" {
+		return "", false
+	}
+	parts := strings.SplitN(h, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return "", false
+	}
+	return parts[1], true
 }
 
 func (h *AuthHandler) Login(c *gin.Context) {
@@ -38,4 +51,33 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		AccessToken:  access,
 		RefreshToken: refresh,
 	})
+}
+
+func (h *AuthHandler) Logout(c *gin.Context) {
+	accessToken, ok := bearerToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid Authorization header"})
+		return
+	}
+
+	if err := h.authService.Logout(accessToken); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_failed", "reason": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": "logged_out"})
+}
+
+func (h *AuthHandler) LogoutAll(c *gin.Context) {
+	accessToken, ok := bearerToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid Authorization header"})
+		return
+	}
+
+	if err := h.authService.LogoutAll(accessToken); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_all_failed", "reason": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"result": "logged_out_all"})
 }
