@@ -1,9 +1,9 @@
 package main
 
 import (
-	"central-auth/internal/http/middleware"
 	"central-auth/internal/config"
 	"central-auth/internal/http/handler"
+	"central-auth/internal/http/middleware"
 	"central-auth/internal/repository"
 	"central-auth/internal/service"
 	"fmt"
@@ -18,7 +18,7 @@ func main() {
 		panic(err)
 	}
 	fmt.Println("Redis connected")
-	
+
 	//Postgres
 	pgPool, err := config.NewPostgresConn()
 	if err != nil {
@@ -49,6 +49,11 @@ func main() {
 	{
 		auth.POST("/login", authHandler.Login)
 		auth.POST("/oauth/login", authHandler.OAuthLogin)
+		auth.POST("/refresh", authHandler.Refresh)
+
+		auth.POST("/logout", authHandler.Logout)
+		auth.POST("/logout-all", authHandler.LogoutAll)
+		auth.POST("/verify", authHandler.Verify)
 	}
 
 	r.Run(":8081")
