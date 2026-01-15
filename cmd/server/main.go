@@ -53,6 +53,7 @@ func main() {
 
 		auth.POST("/logout", authHandler.Logout)
 		auth.POST("/logout-all", authHandler.LogoutAll)
+		auth.POST("/verify", authHandler.Verify)
 	}
 
 	r.Run(":8081")

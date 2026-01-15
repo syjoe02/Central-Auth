@@ -148,3 +148,7 @@ func (s *AuthService) Refresh(refreshToken string) (string, error) {
 
 	return newAccessToken, nil
 }
+
+func (s *AuthService) ExistsSession(userID, deviceID string) (bool, error) {
+	return s.redisRepo.ExistsRefreshToken(userID, deviceID)
+}

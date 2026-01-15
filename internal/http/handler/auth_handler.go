@@ -3,6 +3,7 @@ package handler
 import (
 	"central-auth/internal/model"
 	"central-auth/internal/service"
+	"central-auth/internal/token"
 	"net/http"
 	"strings"
 
@@ -41,7 +42,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	access, refresh, err := h.authService.Login(req.UserID, req.DeviceID, req.RememberMe,)
+	access, refresh, err := h.authService.Login(req.UserID, req.DeviceID, req.RememberMe)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -80,4 +81,34 @@ func (h *AuthHandler) LogoutAll(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"result": "logged_out_all"})
+}
+
+func (h *AuthHandler) Verify(c *gin.Context) {
+	tokenStr, ok := bearerToken(c)
+	if !ok {
+		c.JSON(401, gin.H{"error": "missing token"})
+		return
+	}
+
+	claims, err := token.Parse(tokenStr)
+	if err != nil {
+		c.JSON(401, gin.H{"error": "invalid token"})
+		return
+	}
+
+	// Redis에 refresh token이 살아있는지 확인 (세션 존재 확인)
+	exists, err := h.authService.ExistsSession(
+		claims.UserID,
+		claims.DeviceID,
+	)
+	if err != nil || !exists {
+		c.JSON(401, gin.H{"error": "session expired"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"user_id":   claims.UserID,
+		"device_id": claims.DeviceID,
+		"exp":       claims.ExpiresAt.Time.Unix(),
+	})
 }
