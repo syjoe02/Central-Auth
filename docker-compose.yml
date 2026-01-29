@@ -29,4 +29,8 @@ services:
       - postgres
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: 5432
+      REDIS_ADDR: ${REDIS_ADDR}
     restart: always

@@ -1,11 +1,12 @@
 package handler
 
 import (
+	"net/http"
+	"strings"
+
 	"central-auth/internal/model"
 	"central-auth/internal/service"
 	"central-auth/internal/token"
-	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -42,7 +43,25 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	access, refresh, err := h.authService.Login(req.UserID, req.DeviceID, req.RememberMe)
+	userAgent := c.GetHeader("User-Agent")
+	ip := c.ClientIP()
+
+	var uaPtr *string
+	var ipPtr *string
+	if userAgent != "" {
+		uaPtr = &userAgent
+	}
+	if ip != "" {
+		ipPtr = &ip
+	}
+
+	access, refresh, err := h.authService.Login(
+		req.UserID,
+		req.DeviceID,
+		req.RememberMe,
+		uaPtr,
+		ipPtr,
+	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

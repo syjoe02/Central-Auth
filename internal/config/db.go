@@ -4,8 +4,8 @@ import (
 	"context"
 	"os"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 var Ctx = context.Background()
@@ -23,11 +23,20 @@ func NewRedisClient() *redis.Client {
 }
 
 func NewPostgresConn() (*pgxpool.Pool, error) {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		// Local
-		dsn = "postgres://auth:password@localhost:5432/central_auth?sslmode=disable"
+	host := os.Getenv("POSTGRES_HOST")
+	port := os.Getenv("POSTGRES_PORT")
+	user := os.Getenv("POSTGRES_USER")
+	password := os.Getenv("POSTGRES_PASSWORD")
+	db := os.Getenv("POSTGRES_DB")
+
+	if host == "" {
+		// Local fallback
+		host = "localhost"
 	}
-	
+
+	dsn := "postgres://" + user + ":" + password +
+		"@" + host + ":" + port + "/" + db +
+		"?sslmode=disable"
+
 	return pgxpool.New(context.Background(), dsn)
 }

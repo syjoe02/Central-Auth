@@ -1,13 +1,22 @@
 package repository
 
-type AuthUser struct {
-	UserID          string
-	Provider        string
-	ProviderUserID  string
-	Email           string
-}
+import (
+	"context"
+
+	"central-auth/internal/domain"
+)
 
 type AuthUserRepository interface {
-	FindByProvider(provider, providerUserID string) (*AuthUser, error)
-	Create(user *AuthUser) error
+	// AuthUser
+	FindByProvider(provider, providerID string) (*domain.AuthUser, error)
+	Save(user *domain.AuthUser) error
+
+	// Refresh Token
+	SaveRefreshToken(ctx context.Context, token *domain.RefreshToken) error
+	UpdateLastUsedAt(ctx context.Context, userID string, deviceID string) error
+	RevokeDevice(ctx context.Context, userID string, deviceID string) error
+	RevokeAllDevices(ctx context.Context, userID string) error
+
+	GetLoginDevices(ctx context.Context, userID string) ([]domain.LoginDeviceInfo, error)
+	CountActiveDevices(ctx context.Context, userID string) (int, error)
 }

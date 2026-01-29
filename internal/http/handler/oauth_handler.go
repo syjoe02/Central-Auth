@@ -21,7 +21,7 @@ func (h *AuthHandler) OAuthLogin(c *gin.Context) {
 		return
 	}
 
-	// 1. Google 토큰 검증
+	// 1. Check Google Token
 	claims, err := token.VerifyGoogleIDToken(
 		req.IdToken,
 		os.Getenv("GOOGLE_CLIENT_ID"),
@@ -31,13 +31,27 @@ func (h *AuthHandler) OAuthLogin(c *gin.Context) {
 		return
 	}
 
-	// 2. Central-Auth 기준 userId로 변환 → JWT 발급
+	userAgent := c.GetHeader("User-Agent")
+	ip := c.ClientIP()
+
+	var uaPtr *string
+	var ipPtr *string
+
+	if userAgent != "" {
+		uaPtr = &userAgent
+	}
+	if ip != "" {
+		ipPtr = &ip
+	}
+
 	access, refresh, err := h.authService.OAuthLogin(
 		"google",
 		claims.Subject,
 		claims.Email,
 		req.DeviceID,
 		req.RememberMe,
+		uaPtr,
+		ipPtr,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
