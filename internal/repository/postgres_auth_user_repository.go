@@ -59,7 +59,16 @@ func (r *PostgresAuthUserRepository) SaveRefreshToken(
 		(user_id, device_id, token_hash, issued_at, expires_at, revoked,
 		 user_agent, ip_address, last_used_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-	`
+		ON CONFLICT (user_id, device_id)
+		DO UPDATE SET
+			token_hash   = EXCLUDED.token_hash,
+			issued_at    = EXCLUDED.issued_at,
+			expires_at   = EXCLUDED.expires_at,
+			revoked      = false,
+			user_agent   = EXCLUDED.user_agent,
+			ip_address   = EXCLUDED.ip_address,
+			last_used_at = NULL
+		`
 
 	_, err := r.db.Exec(
 		ctx,
