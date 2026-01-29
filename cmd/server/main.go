@@ -1,12 +1,14 @@
 package main
 
 import (
+	"fmt"
+	"os"
+
 	"central-auth/internal/config"
 	"central-auth/internal/http/handler"
 	"central-auth/internal/http/middleware"
 	"central-auth/internal/repository"
 	"central-auth/internal/service"
-	"fmt"
 
 	"github.com/gin-gonic/gin"
 )
@@ -37,6 +39,9 @@ func main() {
 
 	// Start server
 	r := gin.Default()
+	// log
+	r.Use(gin.LoggerWithWriter(os.Stdout))
+	r.Use(gin.RecoveryWithWriter(os.Stderr))
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
@@ -55,6 +60,6 @@ func main() {
 		auth.POST("/logout-all", authHandler.LogoutAll)
 		auth.POST("/verify", authHandler.Verify)
 	}
-
+	fmt.Println("Central-Auth server running on :8081")
 	r.Run(":8081")
 }
