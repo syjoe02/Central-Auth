@@ -10,7 +10,7 @@ services:
     image: postgres:16-alpine
     container_name: central-auth-postgres
     env_file:
-      - .env
+      - ./env/.env
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -28,7 +28,7 @@ services:
       - redis
       - postgres
     env_file:
-      - .env
+      - ./env/.env
     environment:
       POSTGRES_HOST: ${POSTGRES_HOST}
       POSTGRES_PORT: 5432

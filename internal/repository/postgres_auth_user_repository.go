@@ -59,7 +59,16 @@ func (r *PostgresAuthUserRepository) SaveRefreshToken(
 		(user_id, device_id, token_hash, issued_at, expires_at, revoked,
 		 user_agent, ip_address, last_used_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-	`
+		ON CONFLICT (user_id, device_id)
+		DO UPDATE SET
+			token_hash   = EXCLUDED.token_hash,
+			issued_at    = EXCLUDED.issued_at,
+			expires_at   = EXCLUDED.expires_at,
+			revoked      = false,
+			user_agent   = EXCLUDED.user_agent,
+			ip_address   = EXCLUDED.ip_address,
+			last_used_at = NULL
+		`
 
 	_, err := r.db.Exec(
 		ctx,
@@ -138,6 +147,22 @@ func (r *PostgresAuthUserRepository) CountActiveDevices(
 }
 
 // Update & Revoke
+
+// UpdateTokenHash updates the stored token hash and last_used_at in a single query.
+// Called on /auth/refresh rotation — keeps the Postgres audit record in sync with Redis.
+func (r *PostgresAuthUserRepository) UpdateTokenHash(
+	ctx context.Context,
+	userID, deviceID, newHash string,
+) error {
+	const q = `
+		UPDATE refresh_tokens
+		SET token_hash = $3, last_used_at = NOW()
+		WHERE user_id = $1 AND device_id = $2 AND revoked = false
+	`
+	_, err := r.db.Exec(ctx, q, userID, deviceID, newHash)
+	return err
+}
+
 func (r *PostgresAuthUserRepository) UpdateLastUsedAt(
 	ctx context.Context,
 	userID string,

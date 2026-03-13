@@ -9,11 +9,18 @@ import (
 	"central-auth/internal/http/middleware"
 	"central-auth/internal/repository"
 	"central-auth/internal/service"
+	"central-auth/internal/token"
 
 	"github.com/gin-gonic/gin"
 )
 
 func main() {
+	// Secrets — panic immediately if required env vars are missing
+	token.InitSecret()
+	if os.Getenv("SERVICE_API_KEY") == "" {
+		panic("SERVICE_API_KEY env var must be set")
+	}
+
 	// Redis
 	rdb := config.NewRedisClient()
 	if _, err := rdb.Ping(config.Ctx).Result(); err != nil {

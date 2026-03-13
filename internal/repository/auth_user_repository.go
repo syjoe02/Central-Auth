@@ -13,6 +13,7 @@ type AuthUserRepository interface {
 
 	// Refresh Token
 	SaveRefreshToken(ctx context.Context, token *domain.RefreshToken) error
+	UpdateTokenHash(ctx context.Context, userID, deviceID, newHash string) error
 	UpdateLastUsedAt(ctx context.Context, userID string, deviceID string) error
 	RevokeDevice(ctx context.Context, userID string, deviceID string) error
 	RevokeAllDevices(ctx context.Context, userID string) error
