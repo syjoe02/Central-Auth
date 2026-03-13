@@ -20,6 +20,7 @@ dist/
 vendor/
 
 # ===== Environment =====
+env/
 .env
 
 # ===== IDE / Editor =====
