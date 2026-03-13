@@ -83,15 +83,35 @@ func (r *RedisRepository) SaveLogin(userID, deviceID, refreshToken string, ttl t
 	return nil
 }
 
+// ExistsRefreshToken checks only that the session key is present in Redis.
+// Used by /auth/verify — confirm the session is alive without needing the token value.
 func (r *RedisRepository) ExistsRefreshToken(userID, deviceID string) (bool, error) {
 	ctx := config.Ctx
-	key := "auth:refresh:" + userID + ":" + deviceID
+	key := refreshKey(userID, deviceID)
 	cnt, err := r.client.Exists(ctx, key).Result()
-
 	if err != nil {
 		return false, err
 	}
 	return cnt == 1, nil
+}
+
+// ValidateRefreshToken checks that the session key exists AND its stored value matches
+// the presented token. Used by /auth/refresh after rotation — rejects any previous-generation token.
+func (r *RedisRepository) ValidateRefreshToken(userID, deviceID, tokenStr string) (bool, error) {
+	ctx := config.Ctx
+	stored, err := r.client.Get(ctx, refreshKey(userID, deviceID)).Result()
+	if err != nil {
+		return false, err
+	}
+	return stored == tokenStr, nil
+}
+
+// RotateRefreshToken overwrites the stored refresh token value and resets the TTL.
+// Called on /auth/refresh — the old token string is implicitly invalidated because
+// ValidateRefreshToken will no longer match it.
+func (r *RedisRepository) RotateRefreshToken(userID, deviceID, newToken string, ttl time.Duration) error {
+	ctx := config.Ctx
+	return r.client.Set(ctx, refreshKey(userID, deviceID), newToken, ttl).Err()
 }
 
 func (r *RedisRepository) LogoutDevice(userID, deviceID string) error {

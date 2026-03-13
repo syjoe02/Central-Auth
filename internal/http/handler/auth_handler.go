@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 	"central-auth/internal/token"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 type AuthHandler struct {
@@ -29,6 +31,18 @@ func bearerToken(c *gin.Context) (string, bool) {
 		return "", false
 	}
 	return parts[1], true
+}
+
+// isTokenError returns true for errors caused by the caller (bad/expired/wrong-type token).
+// Returns false for infrastructure failures (Redis, Postgres) which should be 500.
+func isTokenError(err error) bool {
+	return errors.Is(err, token.ErrWrongTokenType) ||
+		errors.Is(err, jwt.ErrTokenMalformed) ||
+		errors.Is(err, jwt.ErrTokenSignatureInvalid) ||
+		errors.Is(err, jwt.ErrTokenUnverifiable) ||
+		errors.Is(err, jwt.ErrTokenExpired) ||
+		errors.Is(err, jwt.ErrTokenNotValidYet) ||
+		errors.Is(err, jwt.ErrTokenInvalidClaims)
 }
 
 func (h *AuthHandler) Login(c *gin.Context) {
@@ -74,28 +88,37 @@ func (h *AuthHandler) Login(c *gin.Context) {
 }
 
 func (h *AuthHandler) Logout(c *gin.Context) {
-	accessToken, ok := bearerToken(c)
+	refreshToken, ok := bearerToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid Authorization header"})
 		return
 	}
 
-	if err := h.authService.Logout(accessToken); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_failed", "reason": err.Error()})
+	if err := h.authService.Logout(refreshToken); err != nil {
+		if isTokenError(err) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_failed", "error_code": "token_invalid", "reason": err.Error()})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout_failed", "error_code": "server_error", "reason": err.Error()})
+		}
 		return
 	}
+
 	c.JSON(http.StatusOK, gin.H{"result": "logged_out"})
 }
 
 func (h *AuthHandler) LogoutAll(c *gin.Context) {
-	accessToken, ok := bearerToken(c)
+	refreshToken, ok := bearerToken(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid Authorization header"})
 		return
 	}
 
-	if err := h.authService.LogoutAll(accessToken); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_all_failed", "reason": err.Error()})
+	if err := h.authService.LogoutAll(refreshToken); err != nil {
+		if isTokenError(err) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_all_failed", "error_code": "token_invalid", "reason": err.Error()})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout_all_failed", "error_code": "server_error", "reason": err.Error()})
+		}
 		return
 	}
 
@@ -105,27 +128,25 @@ func (h *AuthHandler) LogoutAll(c *gin.Context) {
 func (h *AuthHandler) Verify(c *gin.Context) {
 	tokenStr, ok := bearerToken(c)
 	if !ok {
-		c.JSON(401, gin.H{"error": "missing token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
 		return
 	}
 
-	claims, err := token.Parse(tokenStr)
+	// ParseTyped enforces token_type = "access" — refresh tokens are rejected here
+	claims, err := token.ParseTyped(tokenStr, token.TypeAccess)
 	if err != nil {
-		c.JSON(401, gin.H{"error": "invalid token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 		return
 	}
 
-	// Redis에 refresh token이 살아있는지 확인 (세션 존재 확인)
-	exists, err := h.authService.ExistsSession(
-		claims.UserID,
-		claims.DeviceID,
-	)
+	// Fail closed: Redis failure returns 401, not 500 — deny access on uncertainty
+	exists, err := h.authService.ExistsSession(claims.UserID, claims.DeviceID)
 	if err != nil || !exists {
-		c.JSON(401, gin.H{"error": "session expired"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "session expired"})
 		return
 	}
 
-	c.JSON(200, gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"user_id":   claims.UserID,
 		"device_id": claims.DeviceID,
 		"exp":       claims.ExpiresAt.Time.Unix(),

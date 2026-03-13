@@ -147,6 +147,22 @@ func (r *PostgresAuthUserRepository) CountActiveDevices(
 }
 
 // Update & Revoke
+
+// UpdateTokenHash updates the stored token hash and last_used_at in a single query.
+// Called on /auth/refresh rotation — keeps the Postgres audit record in sync with Redis.
+func (r *PostgresAuthUserRepository) UpdateTokenHash(
+	ctx context.Context,
+	userID, deviceID, newHash string,
+) error {
+	const q = `
+		UPDATE refresh_tokens
+		SET token_hash = $3, last_used_at = NOW()
+		WHERE user_id = $1 AND device_id = $2 AND revoked = false
+	`
+	_, err := r.db.Exec(ctx, q, userID, deviceID, newHash)
+	return err
+}
+
 func (r *PostgresAuthUserRepository) UpdateLastUsedAt(
 	ctx context.Context,
 	userID string,

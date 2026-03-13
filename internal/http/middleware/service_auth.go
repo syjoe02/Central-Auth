@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"os"
 
@@ -8,6 +9,8 @@ import (
 )
 
 func ServiceAuthMiddleware() gin.HandlerFunc {
+	expected := []byte(os.Getenv("SERVICE_API_KEY"))
+
 	return func(c *gin.Context) {
 		serviceKey := c.GetHeader("X-Service-Key")
 		if serviceKey == "" {
@@ -17,7 +20,7 @@ func ServiceAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		if serviceKey != os.Getenv("SERVICE_API_KEY") {
+		if subtle.ConstantTimeCompare([]byte(serviceKey), expected) != 1 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": "invalid service key",
 			})

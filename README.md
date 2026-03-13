@@ -1,76 +1,17 @@
-### API Endpoints
+# central-auth
 
-- All endpoints require:
+Internal authentication microservice — issues and validates signed JWT access/refresh token pairs for trusted backend services over a shared API key.
 
-    ```
-    X-Service-Key : <SERVICE_API_KEY>
-    ```
+## Core Structs
 
-### POST /auth/login
-
-- Used when backend already auth the user
-
-    ```
-    {
-        "user_id": "123",
-        "device_id": "device-uuid",
-        "remember_me": true / false
-    }
-    ```
-
-- Response:
-
-    ```
-    {
-        "access_token": "...",
-        "refresh_token": "..."
-    }
-    ```
-
-### POST /auth/oauth/login
-
-- Used when Central-Auth validates OAuth (Google)
-
-    ```
-    {
-        "provider": "google",
-        "id_token": "...",
-        "device_id": "device-uuid",
-        "remember_me": true
-    }
-    ```
-
-- Callback
-
-### POST /auth/refresh
-
-- Return new access token
-
-    ```
-    {
-        "refresh_token": "..."
-    }
-    ```
-
-### POST /auth/logout & /auth/loguout-all
-
-- Revokes this device session & all session for this user
-
-### POST /auth/verify
-
-- Validates AccessToken and confirms Redis session still exists
-
-    ```
-    {
-        "user_id": "123",
-        "device_id": "...",
-        "exp": 1700000000
-    }
-    ```
-
-# Notes
-
-- Tokens are never stored in localStorage and plaintext (hash only in DB and HttpOnly cookie)
-
-- Redis Controls active sessions
+| Struct | Package | Responsibility |
+|---|---|---|
+| `AuthHandler` | `internal/http/handler` | Binds HTTP requests, translates service errors to 401 vs 500 |
+| `AuthService` | `internal/service` | Orchestrates login, logout, refresh, and session verification |
+| `Claims` | `internal/token` | JWT payload — `user_id`, `device_id`, `token_type`, `exp`, `iat` |
+| `RedisRepository` | `internal/repository` | Live session state — stores, rotates, validates, and revokes refresh tokens |
+| `PostgresAuthUserRepository` | `internal/repository` | Audit store — user identity, token hashes, device history, revocation |
+| `AuthUser` | `internal/domain` | OAuth user record keyed on `(provider, provider_user_id)` |
+| `RefreshToken` | `internal/domain` | Audit row — token hash, device metadata, `last_used_at`, revoked flag |
+| `ServiceAuthMiddleware` | `internal/http/middleware` | Guards all `/auth` routes via constant-time `X-Service-Key` comparison |
 
