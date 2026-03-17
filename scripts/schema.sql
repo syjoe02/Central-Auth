@@ -1,4 +1,14 @@
-CREATE TABLE refresh_tokens (
+CREATE TABLE IF NOT EXISTS auth_users (
+    user_id     VARCHAR(64)  PRIMARY KEY,
+    provider    VARCHAR(32)  NOT NULL,
+    provider_user_id VARCHAR(128) NOT NULL,
+    email       VARCHAR(255) NULL,
+    created_at  TIMESTAMPTZ  DEFAULT NOW(),
+
+    CONSTRAINT uq_auth_users_provider UNIQUE (provider, provider_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS refresh_tokens (
     id BIGSERIAL PRIMARY KEY,
 
     user_id VARCHAR(64) NOT NULL,
