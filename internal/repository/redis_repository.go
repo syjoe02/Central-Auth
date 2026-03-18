@@ -1,7 +1,7 @@
 package repository
 
 import (
-	"central-auth/internal/config"
+	"context"
 	"errors"
 	"time"
 
@@ -9,6 +9,16 @@ import (
 )
 
 const MaxDevices int64 = 5
+
+// RedisRepo is the interface that wraps session storage operations.
+type RedisRepo interface {
+	SaveLogin(ctx context.Context, userID, deviceID, refreshToken string, ttl time.Duration) error
+	ExistsRefreshToken(ctx context.Context, userID, deviceID string) (bool, error)
+	ValidateRefreshToken(ctx context.Context, userID, deviceID, tokenStr string) (bool, error)
+	RotateRefreshToken(ctx context.Context, userID, deviceID, newToken string, ttl time.Duration) error
+	LogoutDevice(ctx context.Context, userID, deviceID string) error
+	LogoutAll(ctx context.Context, userID string) error
+}
 
 type RedisRepository struct {
 	client *redis.Client
@@ -27,66 +37,65 @@ func refreshKey(userID, deviceID string) string {
 }
 
 
-func (r *RedisRepository) SaveLogin(userID, deviceID, refreshToken string, ttl time.Duration) error {
-	ctx := config.Ctx
+// saveLoginScript atomically enforces the MaxDevices cap and registers the login.
+//
+// KEYS[1] = devicesKey (auth:devices:<userID>)
+// KEYS[2] = refreshKey for this device (auth:refresh:<userID>:<deviceID>)
+// ARGV[1] = deviceID member string
+// ARGV[2] = login timestamp (unix seconds, float string)
+// ARGV[3] = refresh token value
+// ARGV[4] = TTL in seconds (integer string)
+// ARGV[5] = max devices limit (integer string)
+// ARGV[6] = refresh key prefix  (auth:refresh:<userID>:)
+var saveLoginScript = redis.NewScript(`
+local dKey      = KEYS[1]
+local rKey      = KEYS[2]
+local deviceID  = ARGV[1]
+local score     = tonumber(ARGV[2])
+local tokenVal  = ARGV[3]
+local ttl       = tonumber(ARGV[4])
+local maxDev    = tonumber(ARGV[5])
+local rPrefix   = ARGV[6]
 
-	now := float64(time.Now().Unix())
-	dKey := devicesKey(userID)
+local existing = redis.call('ZSCORE', dKey, deviceID)
+if existing == false then
+    local count = tonumber(redis.call('ZCARD', dKey))
+    if count >= maxDev then
+        local oldest = redis.call('ZRANGE', dKey, 0, 0)
+        if #oldest > 0 then
+            redis.call('ZREM', dKey, oldest[1])
+            redis.call('DEL', rPrefix .. oldest[1])
+        end
+    end
+end
 
-	// checking deviceID
-	count, err := r.client.ZCard(ctx, dKey).Result()
-	if err != nil {
-		return err
-	}
-	existsScore, err := r.client.ZScore(ctx, dKey, deviceID).Result()
-	if err != nil && err != redis.Nil {
-		return err
-	}
+redis.call('ZADD', dKey, score, deviceID)
+redis.call('SET',  rKey, tokenVal, 'EX', ttl)
+local currentTTL = tonumber(redis.call('TTL', dKey))
+if currentTTL < 0 or ttl > currentTTL then
+    redis.call('EXPIRE', dKey, ttl)
+end
+return 1
+`)
 
-	isExistingDevice := (err == nil && existsScore != 0) || (err == nil) // ZScore returns nil err if exists
+func (r *RedisRepository) SaveLogin(ctx context.Context, userID, deviceID, refreshToken string, ttl time.Duration) error {
+	ttlSec := int64(ttl.Seconds())
+	rPrefix := "auth:refresh:" + userID + ":"
 
-	if !isExistingDevice && count >= MaxDevices {
-		oldest, err := r.client.ZRangeWithScores(ctx, dKey, 0, 0).Result()
-		if err != nil {
-			return err
-		}
-		if len(oldest) == 0 {
-			return errors.New("device set empty unexpectedly")
-		}
-
-		oldDeviceID, ok := oldest[0].Member.(string)
-		if !ok {
-			return errors.New("invalid member type in zset")
-		}
-
-		// delete oldest deviceID and refreshToken
-		pipe := r.client.TxPipeline()
-		pipe.ZRem(ctx, dKey, oldDeviceID)
-		pipe.Del(ctx, refreshKey(userID, oldDeviceID))
-		if _, err := pipe.Exec(ctx); err != nil {
-			return err
-		}
-	}
-
-	if err := r.client.ZAdd(ctx, dKey, redis.Z{Score: now, Member: deviceID}).Err(); err != nil {
-		return err
-	}
-
-	if err := r.client.Set(ctx, refreshKey(userID, deviceID), refreshToken, ttl).Err(); err != nil {
-		return err
-	}
-
-	if err := r.client.Expire(ctx, dKey, ttl).Err(); err != nil {
-		return err
-	}
-
-	return nil
+	return saveLoginScript.Run(ctx, r.client,
+		[]string{devicesKey(userID), refreshKey(userID, deviceID)},
+		deviceID,
+		float64(time.Now().Unix()),
+		refreshToken,
+		ttlSec,
+		MaxDevices,
+		rPrefix,
+	).Err()
 }
 
 // ExistsRefreshToken checks only that the session key is present in Redis.
 // Used by /auth/verify — confirm the session is alive without needing the token value.
-func (r *RedisRepository) ExistsRefreshToken(userID, deviceID string) (bool, error) {
-	ctx := config.Ctx
+func (r *RedisRepository) ExistsRefreshToken(ctx context.Context, userID, deviceID string) (bool, error) {
 	key := refreshKey(userID, deviceID)
 	cnt, err := r.client.Exists(ctx, key).Result()
 	if err != nil {
@@ -97,9 +106,11 @@ func (r *RedisRepository) ExistsRefreshToken(userID, deviceID string) (bool, err
 
 // ValidateRefreshToken checks that the session key exists AND its stored value matches
 // the presented token. Used by /auth/refresh after rotation — rejects any previous-generation token.
-func (r *RedisRepository) ValidateRefreshToken(userID, deviceID, tokenStr string) (bool, error) {
-	ctx := config.Ctx
+func (r *RedisRepository) ValidateRefreshToken(ctx context.Context, userID, deviceID, tokenStr string) (bool, error) {
 	stored, err := r.client.Get(ctx, refreshKey(userID, deviceID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -109,13 +120,11 @@ func (r *RedisRepository) ValidateRefreshToken(userID, deviceID, tokenStr string
 // RotateRefreshToken overwrites the stored refresh token value and resets the TTL.
 // Called on /auth/refresh — the old token string is implicitly invalidated because
 // ValidateRefreshToken will no longer match it.
-func (r *RedisRepository) RotateRefreshToken(userID, deviceID, newToken string, ttl time.Duration) error {
-	ctx := config.Ctx
+func (r *RedisRepository) RotateRefreshToken(ctx context.Context, userID, deviceID, newToken string, ttl time.Duration) error {
 	return r.client.Set(ctx, refreshKey(userID, deviceID), newToken, ttl).Err()
 }
 
-func (r *RedisRepository) LogoutDevice(userID, deviceID string) error {
-	ctx := config.Ctx
+func (r *RedisRepository) LogoutDevice(ctx context.Context, userID, deviceID string) error {
 	dKey := devicesKey(userID)
 	rKey := refreshKey(userID, deviceID)
 
@@ -127,8 +136,7 @@ func (r *RedisRepository) LogoutDevice(userID, deviceID string) error {
 	return err
 }
 
-func (r *RedisRepository) LogoutAll(userID string) error {
-	ctx := config.Ctx
+func (r *RedisRepository) LogoutAll(ctx context.Context, userID string) error {
 	dKey := devicesKey(userID)
 
 	devicesIDs, err := r.client.ZRange(ctx, dKey, 0, -1).Result()
