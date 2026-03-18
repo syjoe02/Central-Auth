@@ -28,15 +28,19 @@ func NewPostgresConn() (*pgxpool.Pool, error) {
 	user := os.Getenv("POSTGRES_USER")
 	password := os.Getenv("POSTGRES_PASSWORD")
 	db := os.Getenv("POSTGRES_DB")
+	sslmode := os.Getenv("POSTGRES_SSLMODE")
 
 	if host == "" {
 		// Local fallback
 		host = "localhost"
 	}
+	if sslmode == "" {
+		sslmode = "require"
+	}
 
 	dsn := "postgres://" + user + ":" + password +
 		"@" + host + ":" + port + "/" + db +
-		"?sslmode=disable"
+		"?sslmode=" + sslmode
 
 	return pgxpool.New(context.Background(), dsn)
 }
