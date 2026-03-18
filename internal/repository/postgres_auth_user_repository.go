@@ -2,7 +2,10 @@ package repository
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"central-auth/internal/domain"
@@ -18,7 +21,7 @@ func NewPostgresAuthUserRepository(db *pgxpool.Pool) AuthUserRepository {
 
 // AuthUser
 func (r *PostgresAuthUserRepository) FindByProvider(
-	provider, providerID string,
+	ctx context.Context, provider, providerID string,
 ) (*domain.AuthUser, error) {
 
 	const query = `
@@ -27,23 +30,26 @@ func (r *PostgresAuthUserRepository) FindByProvider(
 		WHERE provider = $1 AND provider_user_id = $2
 	`
 
-	row := r.db.QueryRow(context.Background(), query, provider, providerID)
+	row := r.db.QueryRow(ctx, query, provider, providerID)
 
 	var u domain.AuthUser
 	err := row.Scan(&u.UserID, &u.Provider, &u.ProviderID, &u.Email)
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("FindByProvider: %w", err)
 	}
 	return &u, nil
 }
 
-func (r *PostgresAuthUserRepository) Save(user *domain.AuthUser) error {
+func (r *PostgresAuthUserRepository) Save(ctx context.Context, user *domain.AuthUser) error {
 	const query = `
 		INSERT INTO auth_users (user_id, provider, provider_user_id, email)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (user_id) DO NOTHING
 	`
-	_, err := r.db.Exec(context.Background(), query,
+	_, err := r.db.Exec(ctx, query,
 		user.UserID, user.Provider, user.ProviderID, user.Email)
 	return err
 }
@@ -123,6 +129,10 @@ func (r *PostgresAuthUserRepository) GetLoginDevices(
 			return nil, err
 		}
 		result = append(result, info)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("GetLoginDevices rows: %w", err)
 	}
 
 	return result, nil
