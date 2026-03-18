@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 
 	"central-auth/internal/config"
@@ -20,6 +21,7 @@ func main() {
 	if os.Getenv("SERVICE_API_KEY") == "" {
 		panic("SERVICE_API_KEY env var must be set")
 	}
+	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
 
 	// Redis
 	rdb := config.NewRedisClient()
@@ -42,7 +44,7 @@ func main() {
 	// Service
 	authService := service.NewAuthService(redisRepo, authUserRepo)
 	// Handler
-	authHandler := handler.NewAuthHandler(authService)
+	authHandler := handler.NewAuthHandler(authService, googleClientID)
 
 	// Start server
 	r := gin.Default()
@@ -59,14 +61,16 @@ func main() {
 	auth := r.Group("/auth")
 	auth.Use(middleware.ServiceAuthMiddleware())
 	{
-		auth.POST("/login", authHandler.Login)
-		auth.POST("/oauth/login", authHandler.OAuthLogin)
-		auth.POST("/refresh", authHandler.Refresh)
+		auth.POST("/login", middleware.RateLimitMiddleware(), authHandler.Login)
+		auth.POST("/oauth/login", middleware.RateLimitMiddleware(), authHandler.OAuthLogin)
+		auth.POST("/refresh", middleware.RateLimitMiddleware(), authHandler.Refresh)
 
 		auth.POST("/logout", authHandler.Logout)
 		auth.POST("/logout-all", authHandler.LogoutAll)
 		auth.POST("/verify", authHandler.Verify)
 	}
 	fmt.Println("Central-Auth server running on :8081")
-	r.Run(":8081")
+	if err := r.Run(":8081"); err != nil {
+		log.Fatalf("server exited: %v", err)
+	}
 }
