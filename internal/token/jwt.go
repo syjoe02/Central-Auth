@@ -3,21 +3,27 @@ package token
 import (
 	"errors"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-var secret []byte
+var (
+	secret     []byte
+	secretOnce sync.Once
+)
 
 // InitSecret must be called once at startup before any token operations.
-// Panics if JWT_SECRET is missing or under 32 characters.
+// Subsequent calls are no-ops. Panics if JWT_SECRET is missing or under 32 characters.
 func InitSecret() {
-	s := os.Getenv("JWT_SECRET")
-	if len(s) < 32 {
-		panic("JWT_SECRET env var must be set and at least 32 characters")
-	}
-	secret = []byte(s)
+	secretOnce.Do(func() {
+		s := os.Getenv("JWT_SECRET")
+		if len(s) < 32 {
+			panic("JWT_SECRET env var must be set and at least 32 characters")
+		}
+		secret = []byte(s)
+	})
 }
 
 const (
