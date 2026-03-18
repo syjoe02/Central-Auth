@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"net/http"
 	"strings"
 
@@ -22,12 +23,13 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 
 	refreshToken := parts[1]
 
-	accessToken, newRefreshToken, err := h.authService.Refresh(refreshToken)
+	accessToken, newRefreshToken, err := h.authService.Refresh(c.Request.Context(), refreshToken)
 	if err != nil {
 		if isTokenError(err) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "refresh_failed", "error_code": "token_invalid", "reason": err.Error()})
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "refresh_failed", "error_code": "server_error", "reason": err.Error()})
+			log.Printf("Refresh error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "refresh_failed", "error_code": "server_error"})
 		}
 		return
 	}

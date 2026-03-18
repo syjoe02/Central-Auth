@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -19,20 +20,30 @@ const (
 	RefreshTTLLong  = time.Hour * 24 * 30
 )
 
+// AuthServiceI is the interface that wraps the auth business logic operations.
+type AuthServiceI interface {
+	Login(ctx context.Context, userID, deviceID string, rememberMe bool, userAgent, ip *string) (string, string, error)
+	OAuthLogin(ctx context.Context, provider, providerID, email, deviceID string, rememberMe bool, userAgent, ip *string) (string, string, error)
+	Logout(ctx context.Context, refreshToken string) error
+	LogoutAll(ctx context.Context, refreshToken string) error
+	Refresh(ctx context.Context, refreshToken string) (string, string, error)
+	ExistsSession(ctx context.Context, userID, deviceID string) (bool, error)
+}
+
 type AuthService struct {
-	redisRepo    *repository.RedisRepository
+	redisRepo    repository.RedisRepo
 	authUserRepo repository.AuthUserRepository
 }
 
 func NewAuthService(
-	redisRepo *repository.RedisRepository,
+	redisRepo repository.RedisRepo,
 	authUserRepo repository.AuthUserRepository,
 ) *AuthService {
 	return &AuthService{redisRepo: redisRepo, authUserRepo: authUserRepo}
 }
 
 // accessToken : 15min, refreshToken : 7 days, rememberMe : 30 days
-func (s *AuthService) Login(userID string, deviceID string, rememberMe bool, userAgent *string, ip *string) (string, string, error) {
+func (s *AuthService) Login(ctx context.Context, userID string, deviceID string, rememberMe bool, userAgent *string, ip *string) (string, string, error) {
 	log.Printf("[AUTH] Login start user=%s device=%s", userID, deviceID)
 
 	accessToken, err := token.Generate(userID, deviceID, token.TypeAccess, AccessTokenTTL)
@@ -51,13 +62,13 @@ func (s *AuthService) Login(userID string, deviceID string, rememberMe bool, use
 		return "", "", err
 	}
 
-	if err := s.redisRepo.SaveLogin(userID, deviceID, refreshToken, refreshTTL); err != nil {
+	if err := s.redisRepo.SaveLogin(ctx, userID, deviceID, refreshToken, refreshTTL); err != nil {
 		log.Printf("[ERROR] Redis SaveLogin failed: %+v", err)
-		return "", "", err
+		return "", "", fmt.Errorf("login: save session: %w", err)
 	}
 
 	now := time.Now()
-	err = s.authUserRepo.SaveRefreshToken(context.Background(), &domain.RefreshToken{
+	err = s.authUserRepo.SaveRefreshToken(ctx, &domain.RefreshToken{
 		UserID:     userID,
 		DeviceID:   deviceID,
 		TokenHash:  token.Hash(refreshToken),
@@ -70,7 +81,7 @@ func (s *AuthService) Login(userID string, deviceID string, rememberMe bool, use
 	})
 	if err != nil {
 		log.Printf("[ERROR] Postgres SaveRefreshToken failed: %+v", err)
-		return "", "", err
+		return "", "", fmt.Errorf("login: save token record: %w", err)
 	}
 
 	log.Printf("[AUTH] Login success user=%s device=%s", userID, deviceID)
@@ -79,6 +90,7 @@ func (s *AuthService) Login(userID string, deviceID string, rememberMe bool, use
 
 // OAuthLogin verifies the provider token, upserts the user, and issues tokens.
 func (s *AuthService) OAuthLogin(
+	ctx context.Context,
 	provider string,
 	providerID string,
 	email string,
@@ -91,7 +103,7 @@ func (s *AuthService) OAuthLogin(
 	log.Printf("[AUTH] OAuthLogin start provider=%s providerID=%s device=%s",
 		provider, providerID, deviceID)
 
-	user, err := s.authUserRepo.FindByProvider(provider, providerID)
+	user, err := s.authUserRepo.FindByProvider(ctx, provider, providerID)
 	if err != nil {
 		log.Printf("[ERROR] FindByProvider failed: %+v", err)
 		return "", "", err
@@ -105,7 +117,7 @@ func (s *AuthService) OAuthLogin(
 			ProviderID: providerID,
 			Email:      email,
 		}
-		if err := s.authUserRepo.Save(user); err != nil {
+		if err := s.authUserRepo.Save(ctx, user); err != nil {
 			log.Printf("[ERROR] Save AuthUser failed: %+v", err)
 			return "", "", err
 		}
@@ -128,13 +140,13 @@ func (s *AuthService) OAuthLogin(
 		return "", "", err
 	}
 
-	if err := s.redisRepo.SaveLogin(user.UserID, deviceID, refreshToken, refreshTTL); err != nil {
+	if err := s.redisRepo.SaveLogin(ctx, user.UserID, deviceID, refreshToken, refreshTTL); err != nil {
 		log.Printf("[ERROR] Redis SaveLogin failed: %+v", err)
-		return "", "", err
+		return "", "", fmt.Errorf("oauth login: save session: %w", err)
 	}
 
 	now := time.Now()
-	err = s.authUserRepo.SaveRefreshToken(context.Background(), &domain.RefreshToken{
+	err = s.authUserRepo.SaveRefreshToken(ctx, &domain.RefreshToken{
 		UserID:     user.UserID,
 		DeviceID:   deviceID,
 		TokenHash:  token.Hash(refreshToken),
@@ -147,7 +159,7 @@ func (s *AuthService) OAuthLogin(
 	})
 	if err != nil {
 		log.Printf("[ERROR] Postgres SaveRefreshToken failed: %+v", err)
-		return "", "", err
+		return "", "", fmt.Errorf("oauth login: save token record: %w", err)
 	}
 
 	log.Printf("[AUTH] OAuthLogin success user=%s device=%s", user.UserID, deviceID)
@@ -158,7 +170,7 @@ func (s *AuthService) OAuthLogin(
 // Uses ParseIgnoreExpiry so logout succeeds even when the access token is expired —
 // Django's JWTAuthentication blocks the request before it reaches Go in that case,
 // but this ensures Go is correct if Django's skip_paths is ever updated.
-func (s *AuthService) Logout(refreshToken string) error {
+func (s *AuthService) Logout(ctx context.Context, refreshToken string) error {
 	log.Printf("[AUTH] Logout start")
 
 	claims, err := token.ParseIgnoreExpiry(refreshToken, token.TypeRefresh)
@@ -172,14 +184,14 @@ func (s *AuthService) Logout(refreshToken string) error {
 		return errors.New("missing claims")
 	}
 
-	if err := s.redisRepo.LogoutDevice(claims.UserID, claims.DeviceID); err != nil {
+	if err := s.redisRepo.LogoutDevice(ctx, claims.UserID, claims.DeviceID); err != nil {
 		log.Printf("[ERROR] Redis LogoutDevice failed: %+v", err)
-		return err
+		return fmt.Errorf("logout: revoke session: %w", err)
 	}
 
-	if err := s.authUserRepo.RevokeDevice(context.Background(), claims.UserID, claims.DeviceID); err != nil {
+	if err := s.authUserRepo.RevokeDevice(ctx, claims.UserID, claims.DeviceID); err != nil {
 		log.Printf("[ERROR] Postgres RevokeDevice failed: %+v", err)
-		return err
+		return fmt.Errorf("logout: revoke token record: %w", err)
 	}
 
 	log.Printf("[AUTH] Logout success user=%s device=%s", claims.UserID, claims.DeviceID)
@@ -187,10 +199,10 @@ func (s *AuthService) Logout(refreshToken string) error {
 }
 
 // LogoutAll revokes all sessions for the user identified by the refresh token.
-func (s *AuthService) LogoutAll(refreshToken string) error {
+func (s *AuthService) LogoutAll(ctx context.Context, refreshToken string) error {
 	log.Printf("[AUTH] LogoutAll start")
 
-	claims, err := token.ParseTyped(refreshToken, token.TypeRefresh)
+	claims, err := token.ParseIgnoreExpiry(refreshToken, token.TypeRefresh)
 	if err != nil {
 		log.Printf("[ERROR] Token parse failed: %+v", err)
 		return err
@@ -201,14 +213,14 @@ func (s *AuthService) LogoutAll(refreshToken string) error {
 		return errors.New("missing user_id")
 	}
 
-	if err := s.redisRepo.LogoutAll(claims.UserID); err != nil {
+	if err := s.redisRepo.LogoutAll(ctx, claims.UserID); err != nil {
 		log.Printf("[ERROR] Redis LogoutAll failed: %+v", err)
-		return err
+		return fmt.Errorf("logout all: revoke sessions: %w", err)
 	}
 
-	if err := s.authUserRepo.RevokeAllDevices(context.Background(), claims.UserID); err != nil {
+	if err := s.authUserRepo.RevokeAllDevices(ctx, claims.UserID); err != nil {
 		log.Printf("[ERROR] Postgres RevokeAllDevices failed: %+v", err)
-		return err
+		return fmt.Errorf("logout all: revoke token records: %w", err)
 	}
 
 	log.Printf("[AUTH] LogoutAll success user=%s", claims.UserID)
@@ -217,7 +229,7 @@ func (s *AuthService) LogoutAll(refreshToken string) error {
 
 // Refresh validates the refresh token, rotates it, and returns a new access + refresh token pair.
 // The old refresh token is invalidated in Redis immediately — any replay of the old token is rejected.
-func (s *AuthService) Refresh(refreshToken string) (string, string, error) {
+func (s *AuthService) Refresh(ctx context.Context, refreshToken string) (string, string, error) {
 	log.Printf("[AUTH] Refresh start")
 
 	claims, err := token.ParseTyped(refreshToken, token.TypeRefresh)
@@ -230,7 +242,7 @@ func (s *AuthService) Refresh(refreshToken string) (string, string, error) {
 	deviceID := claims.DeviceID
 
 	// Validate token value against Redis — rejects previous-generation tokens after rotation
-	valid, err := s.redisRepo.ValidateRefreshToken(userID, deviceID, refreshToken)
+	valid, err := s.redisRepo.ValidateRefreshToken(ctx, userID, deviceID, refreshToken)
 	if err != nil {
 		log.Printf("[ERROR] Redis ValidateRefreshToken failed: %+v", err)
 		return "", "", err
@@ -259,15 +271,15 @@ func (s *AuthService) Refresh(refreshToken string) (string, string, error) {
 	}
 
 	// Overwrite Redis with the new token — old token string is now invalid
-	if err := s.redisRepo.RotateRefreshToken(userID, deviceID, newRefreshToken, refreshTTL); err != nil {
+	if err := s.redisRepo.RotateRefreshToken(ctx, userID, deviceID, newRefreshToken, refreshTTL); err != nil {
 		log.Printf("[ERROR] Redis RotateRefreshToken failed: %+v", err)
-		return "", "", err
+		return "", "", fmt.Errorf("refresh: rotate session: %w", err)
 	}
 
 	// Update Postgres hash + last_used_at in one query
-	if err := s.authUserRepo.UpdateTokenHash(context.Background(), userID, deviceID, token.Hash(newRefreshToken)); err != nil {
+	if err := s.authUserRepo.UpdateTokenHash(ctx, userID, deviceID, token.Hash(newRefreshToken)); err != nil {
 		log.Printf("[ERROR] Postgres UpdateTokenHash failed: %+v", err)
-		return "", "", err
+		return "", "", fmt.Errorf("refresh: update token record: %w", err)
 	}
 
 	log.Printf("[AUTH] Refresh success user=%s device=%s", userID, deviceID)
@@ -276,8 +288,8 @@ func (s *AuthService) Refresh(refreshToken string) (string, string, error) {
 
 // ExistsSession checks whether a live session exists in Redis for the given user+device.
 // Used by /auth/verify — only needs existence, not token value validation.
-func (s *AuthService) ExistsSession(userID, deviceID string) (bool, error) {
-	exists, err := s.redisRepo.ExistsRefreshToken(userID, deviceID)
+func (s *AuthService) ExistsSession(ctx context.Context, userID, deviceID string) (bool, error) {
+	exists, err := s.redisRepo.ExistsRefreshToken(ctx, userID, deviceID)
 	if err != nil {
 		log.Printf("[ERROR] ExistsSession Redis check failed: %+v", err)
 	}

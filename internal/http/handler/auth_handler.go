@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 
@@ -14,11 +15,15 @@ import (
 )
 
 type AuthHandler struct {
-	authService *service.AuthService
+	authService    service.AuthServiceI
+	googleClientID string
 }
 
-func NewAuthHandler(authService *service.AuthService) *AuthHandler {
-	return &AuthHandler{authService: authService}
+func NewAuthHandler(authService service.AuthServiceI, googleClientID string) *AuthHandler {
+	if googleClientID == "" {
+		panic("GOOGLE_CLIENT_ID env var must be set")
+	}
+	return &AuthHandler{authService: authService, googleClientID: googleClientID}
 }
 
 func bearerToken(c *gin.Context) (string, bool) {
@@ -52,11 +57,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	if req.DeviceID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "device_id is required"})
-		return
-	}
-
 	userAgent := c.GetHeader("User-Agent")
 	ip := c.ClientIP()
 
@@ -70,6 +70,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	access, refresh, err := h.authService.Login(
+		c.Request.Context(),
 		req.UserID,
 		req.DeviceID,
 		req.RememberMe,
@@ -77,7 +78,8 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		ipPtr,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("Login error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 		return
 	}
 
@@ -94,11 +96,12 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		return
 	}
 
-	if err := h.authService.Logout(refreshToken); err != nil {
+	if err := h.authService.Logout(c.Request.Context(), refreshToken); err != nil {
 		if isTokenError(err) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_failed", "error_code": "token_invalid", "reason": err.Error()})
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout_failed", "error_code": "server_error", "reason": err.Error()})
+			log.Printf("Logout error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout_failed", "error_code": "server_error"})
 		}
 		return
 	}
@@ -113,11 +116,12 @@ func (h *AuthHandler) LogoutAll(c *gin.Context) {
 		return
 	}
 
-	if err := h.authService.LogoutAll(refreshToken); err != nil {
+	if err := h.authService.LogoutAll(c.Request.Context(), refreshToken); err != nil {
 		if isTokenError(err) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "logout_all_failed", "error_code": "token_invalid", "reason": err.Error()})
 		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout_all_failed", "error_code": "server_error", "reason": err.Error()})
+			log.Printf("LogoutAll error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "logout_all_failed", "error_code": "server_error"})
 		}
 		return
 	}
@@ -140,7 +144,7 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 	}
 
 	// Fail closed: Redis failure returns 401, not 500 — deny access on uncertainty
-	exists, err := h.authService.ExistsSession(claims.UserID, claims.DeviceID)
+	exists, err := h.authService.ExistsSession(c.Request.Context(), claims.UserID, claims.DeviceID)
 	if err != nil || !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "session expired"})
 		return

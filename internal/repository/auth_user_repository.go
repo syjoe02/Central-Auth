@@ -8,8 +8,8 @@ import (
 
 type AuthUserRepository interface {
 	// AuthUser
-	FindByProvider(provider, providerID string) (*domain.AuthUser, error)
-	Save(user *domain.AuthUser) error
+	FindByProvider(ctx context.Context, provider, providerID string) (*domain.AuthUser, error)
+	Save(ctx context.Context, user *domain.AuthUser) error
 
 	// Refresh Token
 	SaveRefreshToken(ctx context.Context, token *domain.RefreshToken) error

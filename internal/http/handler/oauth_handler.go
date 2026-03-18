@@ -1,10 +1,11 @@
 package handler
 
 import (
+	"log"
+	"net/http"
+
 	"central-auth/internal/model"
 	"central-auth/internal/token"
-	"net/http"
-	"os"
 
 	"github.com/gin-gonic/gin"
 )
@@ -24,7 +25,7 @@ func (h *AuthHandler) OAuthLogin(c *gin.Context) {
 	// 1. Check Google Token
 	claims, err := token.VerifyGoogleIDToken(
 		req.IdToken,
-		os.Getenv("GOOGLE_CLIENT_ID"),
+		h.googleClientID,
 	)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid google token"})
@@ -45,6 +46,7 @@ func (h *AuthHandler) OAuthLogin(c *gin.Context) {
 	}
 
 	access, refresh, err := h.authService.OAuthLogin(
+		c.Request.Context(),
 		"google",
 		claims.Subject,
 		claims.Email,
@@ -54,7 +56,8 @@ func (h *AuthHandler) OAuthLogin(c *gin.Context) {
 		ipPtr,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		log.Printf("OAuthLogin error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 		return
 	}
 
