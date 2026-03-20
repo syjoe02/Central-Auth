@@ -20,12 +20,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"central-auth/internal/metrics"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -87,6 +90,10 @@ type ClientI interface {
 	RevokeAllForSubject(ctx context.Context, kratosID string) error
 	IntrospectToken(ctx context.Context, token string) (*IntrospectResult, error)
 	ValidateAccessToken(ctx context.Context, tokenStr string) (*AccessTokenClaims, error)
+	// ForceRefreshJWKS reloads the JWKS cache immediately, rotating the current
+	// keys to the "previous" generation and fetching fresh keys from Hydra.
+	// Used for zero-downtime key rotation via POST /admin/jwks/refresh or SIGHUP.
+	ForceRefreshJWKS(ctx context.Context) error
 }
 
 // compile-time check
@@ -106,31 +113,67 @@ type jwksResponse struct {
 	Keys []jwkKey `json:"keys"`
 }
 
-// jwksCache caches public keys fetched from Hydra's JWKS endpoint.
+// jwksCache caches public keys from Hydra's JWKS endpoint.
+//
+// Zero-downtime key rotation: when Hydra rotates its signing keys the cache
+// stores one generation of "previous" keys alongside the current set.
+// Tokens signed with a previous kid are still accepted for the configured
+// gracePeriod after the cache was last refreshed, giving in-flight tokens
+// time to expire naturally.
 type jwksCache struct {
-	mu        sync.RWMutex
+	mu sync.RWMutex
+
+	// current generation
 	keys      map[string]*rsa.PublicKey
 	fetchedAt time.Time
-	ttl       time.Duration
+
+	// previous generation (kept for gracePeriod after a rotation)
+	previousKeys      map[string]*rsa.PublicKey
+	previousFetchedAt time.Time
+
+	ttl         time.Duration
+	gracePeriod time.Duration
 }
 
-func newJWKSCache() *jwksCache {
+func newJWKSCache(gracePeriod time.Duration) *jwksCache {
 	return &jwksCache{
-		keys: make(map[string]*rsa.PublicKey),
-		ttl:  1 * time.Hour,
+		keys:        make(map[string]*rsa.PublicKey),
+		previousKeys: make(map[string]*rsa.PublicKey),
+		ttl:         1 * time.Hour,
+		gracePeriod: gracePeriod,
 	}
 }
 
+// get looks up a public key by kid.
+// Current keys are checked first. If not found and the previous generation is
+// still within the grace period, it falls back to the previous generation and
+// increments the deprecated-kid metric.
 func (jc *jwksCache) get(kid string) (*rsa.PublicKey, bool) {
 	jc.mu.RLock()
 	defer jc.mu.RUnlock()
-	k, ok := jc.keys[kid]
-	return k, ok
+
+	if k, ok := jc.keys[kid]; ok {
+		return k, true
+	}
+
+	// Grace-period fallback for zero-downtime key rotation.
+	if len(jc.previousKeys) > 0 && time.Since(jc.previousFetchedAt) < jc.gracePeriod {
+		if k, ok := jc.previousKeys[kid]; ok {
+			// Emit metric and log; do not block the request.
+			metrics.BFFJWKSDeprecatedKidUsed.Inc()
+			log.Printf("[WARN] hydra: JWT validated with deprecated JWKS kid=%q; rotate tokens soon", kid)
+			return k, true
+		}
+	}
+	return nil, false
 }
 
+// set rotates current keys to previous and installs new current keys.
 func (jc *jwksCache) set(keys map[string]*rsa.PublicKey) {
 	jc.mu.Lock()
 	defer jc.mu.Unlock()
+	jc.previousKeys = jc.keys
+	jc.previousFetchedAt = jc.fetchedAt
 	jc.keys = keys
 	jc.fetchedAt = time.Now()
 }
@@ -149,6 +192,11 @@ type Client struct {
 	clientSecret string
 	redirectURI  string
 
+	// expectedIssuer and expectedAudience are validated in ValidateAccessToken.
+	// When set, tokens without matching iss/aud claims are rejected.
+	expectedIssuer   string
+	expectedAudience string
+
 	// httpClient follows redirects (used for token exchange).
 	httpClient *http.Client
 	// noRedirectClient does NOT follow redirects (used for the programmatic auth code flow).
@@ -157,9 +205,32 @@ type Client struct {
 	jwks *jwksCache
 }
 
+// Option is a functional option for Client.
+type Option func(*Client)
+
+// WithGracePeriod sets how long keys from the previous JWKS generation remain
+// valid after a key rotation. Defaults to 30 minutes.
+func WithGracePeriod(d time.Duration) Option {
+	return func(c *Client) {
+		c.jwks.gracePeriod = d
+	}
+}
+
+// WithExpectedIssuer sets the expected `iss` claim for JWT validation.
+// When set, tokens with a different issuer are rejected.
+func WithExpectedIssuer(issuer string) Option {
+	return func(c *Client) { c.expectedIssuer = issuer }
+}
+
+// WithExpectedAudience sets the expected `aud` claim for JWT validation.
+// When set, tokens without a matching audience are rejected.
+func WithExpectedAudience(audience string) Option {
+	return func(c *Client) { c.expectedAudience = audience }
+}
+
 // New creates a new Hydra Client.
-func New(publicURL, adminURL, clientID, clientSecret, redirectURI string) *Client {
-	return &Client{
+func New(publicURL, adminURL, clientID, clientSecret, redirectURI string, opts ...Option) *Client {
+	c := &Client{
 		publicURL:    publicURL,
 		adminURL:     adminURL,
 		clientID:     clientID,
@@ -174,8 +245,19 @@ func New(publicURL, adminURL, clientID, clientSecret, redirectURI string) *Clien
 				return http.ErrUseLastResponse
 			},
 		},
-		jwks: newJWKSCache(),
+		jwks: newJWKSCache(30 * time.Minute),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// ForceRefreshJWKS forces an immediate JWKS cache reload, rotating current
+// keys to the "previous" generation. Call this when Hydra rotates its signing
+// keys to allow in-flight tokens to validate for the grace period.
+func (c *Client) ForceRefreshJWKS(ctx context.Context) error {
+	return c.refreshJWKS(ctx)
 }
 
 // IssueTokens runs the full programmatic authorization code flow server-side:
@@ -382,7 +464,19 @@ func (c *Client) IntrospectToken(ctx context.Context, token string) (*Introspect
 // ValidateAccessToken validates a Hydra-issued JWT access token locally using
 // cached JWKS public keys. This is the fast path for /auth/verify.
 // Fail-closed: any error returns a non-nil error.
+//
+// Validates: RS256 signature, exp claim, and (when configured) iss + aud claims.
 func (c *Client) ValidateAccessToken(ctx context.Context, tokenStr string) (*AccessTokenClaims, error) {
+	parserOpts := []jwt.ParserOption{
+		jwt.WithExpirationRequired(),
+	}
+	if c.expectedIssuer != "" {
+		parserOpts = append(parserOpts, jwt.WithIssuer(c.expectedIssuer))
+	}
+	if c.expectedAudience != "" {
+		parserOpts = append(parserOpts, jwt.WithAudience(c.expectedAudience))
+	}
+
 	claims := &AccessTokenClaims{}
 	token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
@@ -390,7 +484,7 @@ func (c *Client) ValidateAccessToken(ctx context.Context, tokenStr string) (*Acc
 		}
 		kid, _ := t.Header["kid"].(string)
 		return c.resolveKey(ctx, kid)
-	})
+	}, parserOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("hydra: token validation failed: %w", err)
 	}
@@ -522,9 +616,17 @@ func (c *Client) refreshJWKS(ctx context.Context) error {
 		}
 		pub, err := parseRSAPublicKey(k.N, k.E)
 		if err != nil {
+			// Log the failure but continue — other keys in the set may be usable.
+			// Security fix F-10: don't silently drop parse errors.
+			log.Printf("[WARN] hydra: JWKS parse failed for kid=%q: %v", k.Kid, err)
 			continue
 		}
 		keys[k.Kid] = pub
+	}
+	// Security fix F-10: refuse to install an empty key set — this would make all
+	// new token validations fail and could be triggered by a tampered JWKS response.
+	if len(keys) == 0 {
+		return fmt.Errorf("hydra: JWKS response contained no usable RSA signing keys (got %d raw keys)", len(jwks.Keys))
 	}
 	c.jwks.set(keys)
 	return nil
