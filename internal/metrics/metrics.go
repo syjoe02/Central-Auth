@@ -55,6 +55,48 @@ var (
 		},
 		[]string{"operation"},
 	)
+
+	// BFF session metrics.
+
+	BFFSessionsCreated = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_bff_sessions_created_total",
+		Help: "Total BFF sessions created (logins).",
+	})
+
+	BFFSessionsDestroyed = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_bff_sessions_destroyed_total",
+		Help: "Total BFF sessions destroyed (logouts).",
+	})
+
+	// BFFBlacklistChecks counts blacklist lookups; label "result" is "hit" or "miss".
+	BFFBlacklistChecks = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "central_auth_bff_blacklist_checks_total",
+			Help: "Total BFF blacklist checks by result (hit/miss).",
+		},
+		[]string{"result"},
+	)
+
+	// BFFTokenRefreshes counts proactive Hydra token refreshes; label "result" is "ok" or "error".
+	BFFTokenRefreshes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "central_auth_bff_token_refreshes_total",
+			Help: "Total proactive Hydra token refreshes triggered by the BFF.",
+		},
+		[]string{"result"},
+	)
+
+	// BFFJWKSDeprecatedKidUsed increments each time a token is validated using
+	// a key from the previous JWKS generation (during a rotation grace period).
+	BFFJWKSDeprecatedKidUsed = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_bff_jwks_deprecated_kid_used_total",
+		Help: "Times a JWT was validated with a key from the previous JWKS generation.",
+	})
+
+	BFFCSRFRejected = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_bff_csrf_rejected_total",
+		Help: "Total requests rejected by the CSRF middleware.",
+	})
 )
 
 func init() {
@@ -65,5 +107,11 @@ func init() {
 		RedisOps,
 		PostgresOps,
 		OryOps,
+		BFFSessionsCreated,
+		BFFSessionsDestroyed,
+		BFFBlacklistChecks,
+		BFFTokenRefreshes,
+		BFFJWKSDeprecatedKidUsed,
+		BFFCSRFRejected,
 	)
 }
