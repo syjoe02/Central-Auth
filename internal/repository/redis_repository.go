@@ -10,43 +10,47 @@ import (
 
 const MaxDevices int64 = 5
 
-// RedisRepo is the interface that wraps session storage operations.
+// RedisRepo defines session-enforcement operations backed by Redis.
+// After migration to Ory, Redis is responsible for:
+//   - Atomically enforcing the max-5-device limit on login (Lua script).
+//   - Storing the current Hydra refresh token per device (for targeted logout).
+//   - Device set management (add on login, remove on logout).
 type RedisRepo interface {
-	SaveLogin(ctx context.Context, userID, deviceID, refreshToken string, ttl time.Duration) error
-	ExistsRefreshToken(ctx context.Context, userID, deviceID string) (bool, error)
-	ValidateRefreshToken(ctx context.Context, userID, deviceID, tokenStr string) (bool, error)
-	RotateRefreshToken(ctx context.Context, userID, deviceID, newToken string, ttl time.Duration) error
-	LogoutDevice(ctx context.Context, userID, deviceID string) error
-	LogoutAll(ctx context.Context, userID string) error
+	SaveLogin(ctx context.Context, kratosID, deviceID, hydraRefreshToken string, ttl time.Duration) error
+	GetDeviceRefreshToken(ctx context.Context, kratosID, deviceID string) (string, error)
+	RotateRefreshToken(ctx context.Context, kratosID, deviceID, newToken string, ttl time.Duration) error
+	LogoutDevice(ctx context.Context, kratosID, deviceID string) error
+	LogoutAll(ctx context.Context, kratosID string) error
 }
 
+// RedisRepository implements RedisRepo using go-redis.
 type RedisRepository struct {
 	client *redis.Client
 }
 
+// NewRedisRepository creates a new RedisRepository.
 func NewRedisRepository(client *redis.Client) *RedisRepository {
 	return &RedisRepository{client: client}
 }
 
-func devicesKey(userID string) string {
-	return "auth:devices:" + userID
+func devicesKey(kratosID string) string {
+	return "auth:devices:" + kratosID
 }
 
-func refreshKey(userID, deviceID string) string {
-	return "auth:refresh:" + userID + ":" + deviceID
+func refreshKey(kratosID, deviceID string) string {
+	return "auth:refresh:" + kratosID + ":" + deviceID
 }
-
 
 // saveLoginScript atomically enforces the MaxDevices cap and registers the login.
 //
-// KEYS[1] = devicesKey (auth:devices:<userID>)
-// KEYS[2] = refreshKey for this device (auth:refresh:<userID>:<deviceID>)
+// KEYS[1] = devicesKey  (auth:devices:<kratosID>)
+// KEYS[2] = refreshKey  (auth:refresh:<kratosID>:<deviceID>)
 // ARGV[1] = deviceID member string
 // ARGV[2] = login timestamp (unix seconds, float string)
-// ARGV[3] = refresh token value
+// ARGV[3] = Hydra refresh token value
 // ARGV[4] = TTL in seconds (integer string)
 // ARGV[5] = max devices limit (integer string)
-// ARGV[6] = refresh key prefix  (auth:refresh:<userID>:)
+// ARGV[6] = refresh key prefix (auth:refresh:<kratosID>:)
 var saveLoginScript = redis.NewScript(`
 local dKey      = KEYS[1]
 local rKey      = KEYS[2]
@@ -78,78 +82,59 @@ end
 return 1
 `)
 
-func (r *RedisRepository) SaveLogin(ctx context.Context, userID, deviceID, refreshToken string, ttl time.Duration) error {
+// SaveLogin atomically enforces the max-device cap and stores the Hydra refresh token.
+// If the identity already has MaxDevices active devices, the oldest is evicted.
+func (r *RedisRepository) SaveLogin(ctx context.Context, kratosID, deviceID, hydraRefreshToken string, ttl time.Duration) error {
 	ttlSec := int64(ttl.Seconds())
-	rPrefix := "auth:refresh:" + userID + ":"
-
+	rPrefix := "auth:refresh:" + kratosID + ":"
 	return saveLoginScript.Run(ctx, r.client,
-		[]string{devicesKey(userID), refreshKey(userID, deviceID)},
+		[]string{devicesKey(kratosID), refreshKey(kratosID, deviceID)},
 		deviceID,
 		float64(time.Now().Unix()),
-		refreshToken,
+		hydraRefreshToken,
 		ttlSec,
 		MaxDevices,
 		rPrefix,
 	).Err()
 }
 
-// ExistsRefreshToken checks only that the session key is present in Redis.
-// Used by /auth/verify — confirm the session is alive without needing the token value.
-func (r *RedisRepository) ExistsRefreshToken(ctx context.Context, userID, deviceID string) (bool, error) {
-	key := refreshKey(userID, deviceID)
-	cnt, err := r.client.Exists(ctx, key).Result()
-	if err != nil {
-		return false, err
-	}
-	return cnt == 1, nil
-}
-
-// ValidateRefreshToken checks that the session key exists AND its stored value matches
-// the presented token. Used by /auth/refresh after rotation — rejects any previous-generation token.
-func (r *RedisRepository) ValidateRefreshToken(ctx context.Context, userID, deviceID, tokenStr string) (bool, error) {
-	stored, err := r.client.Get(ctx, refreshKey(userID, deviceID)).Result()
+// GetDeviceRefreshToken retrieves the stored Hydra refresh token for a specific device.
+// Used by the Logout flow to revoke the exact refresh token without an extra introspection call.
+func (r *RedisRepository) GetDeviceRefreshToken(ctx context.Context, kratosID, deviceID string) (string, error) {
+	token, err := r.client.Get(ctx, refreshKey(kratosID, deviceID)).Result()
 	if errors.Is(err, redis.Nil) {
-		return false, nil
+		return "", nil
 	}
-	if err != nil {
-		return false, err
-	}
-	return stored == tokenStr, nil
+	return token, err
 }
 
-// RotateRefreshToken overwrites the stored refresh token value and resets the TTL.
-// Called on /auth/refresh — the old token string is implicitly invalidated because
-// ValidateRefreshToken will no longer match it.
-func (r *RedisRepository) RotateRefreshToken(ctx context.Context, userID, deviceID, newToken string, ttl time.Duration) error {
-	return r.client.Set(ctx, refreshKey(userID, deviceID), newToken, ttl).Err()
+// RotateRefreshToken overwrites the stored Hydra refresh token and resets the TTL.
+// Called on /auth/refresh — the old token becomes invalid in Hydra automatically.
+func (r *RedisRepository) RotateRefreshToken(ctx context.Context, kratosID, deviceID, newToken string, ttl time.Duration) error {
+	return r.client.Set(ctx, refreshKey(kratosID, deviceID), newToken, ttl).Err()
 }
 
-func (r *RedisRepository) LogoutDevice(ctx context.Context, userID, deviceID string) error {
-	dKey := devicesKey(userID)
-	rKey := refreshKey(userID, deviceID)
-
+// LogoutDevice atomically removes the device from the devices set and deletes
+// the stored refresh token.
+func (r *RedisRepository) LogoutDevice(ctx context.Context, kratosID, deviceID string) error {
 	pipe := r.client.TxPipeline()
-	pipe.Del(ctx, rKey)
-	pipe.ZRem(ctx, dKey, deviceID)
-
+	pipe.Del(ctx, refreshKey(kratosID, deviceID))
+	pipe.ZRem(ctx, devicesKey(kratosID), deviceID)
 	_, err := pipe.Exec(ctx)
 	return err
 }
 
-func (r *RedisRepository) LogoutAll(ctx context.Context, userID string) error {
-	dKey := devicesKey(userID)
-
-	devicesIDs, err := r.client.ZRange(ctx, dKey, 0, -1).Result()
+// LogoutAll atomically removes all device entries and their refresh tokens for the identity.
+func (r *RedisRepository) LogoutAll(ctx context.Context, kratosID string) error {
+	dKey := devicesKey(kratosID)
+	deviceIDs, err := r.client.ZRange(ctx, dKey, 0, -1).Result()
 	if err != nil {
 		return err
 	}
-
 	pipe := r.client.TxPipeline()
-
-	for _, deviceID := range devicesIDs {
-		pipe.Del(ctx, refreshKey(userID, deviceID))
+	for _, deviceID := range deviceIDs {
+		pipe.Del(ctx, refreshKey(kratosID, deviceID))
 	}
-
 	pipe.Del(ctx, dKey)
 	_, err = pipe.Exec(ctx)
 	return err
