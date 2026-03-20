@@ -1,40 +1,38 @@
-CREATE TABLE IF NOT EXISTS auth_users (
-    user_id     VARCHAR(64)  PRIMARY KEY,
-    provider    VARCHAR(32)  NOT NULL,
-    provider_user_id VARCHAR(128) NOT NULL,
-    email       VARCHAR(255) NULL,
-    created_at  TIMESTAMPTZ  DEFAULT NOW(),
+-- =============================================================================
+-- Central-Auth Application Database Schema
+-- =============================================================================
+-- This database (central_auth) stores ONLY application-level data.
+-- Identity data lives in the Kratos database (managed by Ory Kratos).
+-- OAuth2 token data lives in the Hydra database (managed by Ory Hydra).
+-- =============================================================================
 
-    CONSTRAINT uq_auth_users_provider UNIQUE (provider, provider_user_id)
+-- device_sessions tracks active and historical login sessions per Kratos identity.
+-- It is an AUDIT LOG — Hydra owns the actual token lifecycle.
+-- kratosID is the Ory Kratos identity.id (UUID string).
+CREATE TABLE IF NOT EXISTS device_sessions (
+    id           BIGSERIAL    PRIMARY KEY,
+    kratos_id    VARCHAR(64)  NOT NULL,
+    device_id    VARCHAR(128) NOT NULL,
+
+    -- hydra_jti is the Hydra access token JTI at time of login; used for correlation only.
+    hydra_jti    VARCHAR(256) NULL,
+
+    issued_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ  NULL,
+
+    revoked      BOOLEAN      NOT NULL DEFAULT FALSE,
+
+    user_agent   TEXT         NULL,
+    ip_address   VARCHAR(64)  NULL,
+
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_device_sessions_kratos_device UNIQUE (kratos_id, device_id)
 );
 
-CREATE TABLE IF NOT EXISTS refresh_tokens (
-    id BIGSERIAL PRIMARY KEY,
+CREATE INDEX IF NOT EXISTS idx_device_sessions_kratos
+    ON device_sessions(kratos_id);
 
-    user_id VARCHAR(64) NOT NULL,
-    device_id VARCHAR(128) NOT NULL,
-    token_hash TEXT NOT NULL,
-
-    issued_at TIMESTAMPTZ NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    last_used_at TIMESTAMPTZ NULL,
-
-    revoked BOOLEAN NOT NULL DEFAULT FALSE,
-
-    user_agent TEXT NULL,
-    ip_address VARCHAR(64) NULL,
-
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-
-    CONSTRAINT uq_refresh_tokens_user_device UNIQUE (user_id, device_id)
-);
-
-CREATE INDEX idx_refresh_tokens_user
-ON refresh_tokens(user_id);
-
-CREATE INDEX idx_refresh_tokens_active
-ON refresh_tokens(user_id)
-WHERE revoked = false AND expires_at > NOW();
-
-CREATE INDEX idx_refresh_tokens_expires
-ON refresh_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_device_sessions_active
+    ON device_sessions(kratos_id)
+    WHERE revoked = false;
