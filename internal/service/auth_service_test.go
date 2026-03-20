@@ -40,6 +40,7 @@ func (m *mockHydraClient) IntrospectToken(ctx context.Context, token string) (*h
 func (m *mockHydraClient) ValidateAccessToken(ctx context.Context, token string) (*hydra.AccessTokenClaims, error) {
 	return m.validateAccessFunc(ctx, token)
 }
+func (m *mockHydraClient) ForceRefreshJWKS(_ context.Context) error { return nil }
 
 // ── Mock: RedisRepo ──────────────────────────────────────────────────────────
 
