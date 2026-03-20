@@ -17,7 +17,99 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
     restart: always
+
+  # ─── Ory Kratos: Identity Management ───────────────────────────────────────
+
+  kratos-migrate:
+    image: oryd/kratos:v1.3.0
+    container_name: central-auth-kratos-migrate
+    environment:
+      DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/kratos?sslmode=disable
+    command: migrate sql -e --yes
+    depends_on:
+      - postgres
+    restart: on-failure
+
+  kratos:
+    image: oryd/kratos:v1.3.0
+    container_name: central-auth-kratos
+    ports:
+      - "4433:4433" # public
+      - "4434:4434" # admin
+    environment:
+      DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/kratos?sslmode=disable
+      SECRETS_COOKIE: ${KRATOS_COOKIE_SECRET}
+      SECRETS_CIPHER: ${KRATOS_CIPHER_SECRET}
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      SELFSERVICE_METHODS_OIDC_CONFIG_PROVIDERS_0_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+    volumes:
+      - ./kratos/kratos.yml:/etc/config/kratos/kratos.yml:ro
+      - ./kratos/identity.schema.json:/etc/config/kratos/identity.schema.json:ro
+      - ./kratos/google.mapper.jsonnet:/etc/config/kratos/google.mapper.jsonnet:ro
+    command: serve -c /etc/config/kratos/kratos.yml --dev --watch-courier
+    depends_on:
+      - kratos-migrate
+    restart: always
+
+  # ─── Ory Hydra: OAuth2 / OIDC ──────────────────────────────────────────────
+
+  hydra-migrate:
+    image: oryd/hydra:v2.3.0
+    container_name: central-auth-hydra-migrate
+    environment:
+      DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable
+    command: migrate sql -e --yes
+    depends_on:
+      - postgres
+    restart: on-failure
+
+  hydra:
+    image: oryd/hydra:v2.3.0
+    container_name: central-auth-hydra
+    ports:
+      - "4444:4444" # public (OAuth2 endpoints)
+      - "4445:4445" # admin
+    environment:
+      DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable
+      SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET}
+      URLS_SELF_ISSUER: http://hydra:4444/
+      URLS_LOGIN: http://auth-server:8081/hydra/login
+      URLS_CONSENT: http://auth-server:8081/hydra/consent
+      URLS_LOGOUT: http://auth-server:8081/hydra/logout
+      # Issue access tokens as JWTs so the Go service can validate locally without
+      # a Hydra round-trip on every /auth/verify call.
+      STRATEGIES_ACCESS_TOKEN: jwt
+      TTL_ACCESS_TOKEN: 15m
+      TTL_REFRESH_TOKEN: 720h # 30 days; short sessions enforced via Redis device TTL
+    depends_on:
+      - hydra-migrate
+    restart: always
+
+  # Registers the central-auth OAuth2 client in Hydra on first start.
+  hydra-client-init:
+    image: oryd/hydra:v2.3.0
+    container_name: central-auth-hydra-client-init
+    environment:
+      HYDRA_ADMIN_URL: http://hydra:4445
+    command: >
+      clients create
+      --endpoint http://hydra:4445
+      --id ${HYDRA_CLIENT_ID}
+      --secret ${HYDRA_CLIENT_SECRET}
+      --grant-types authorization_code,refresh_token,client_credentials
+      --response-types code,id_token
+      --scope openid,offline_access,email,profile
+      --redirect-uris http://auth-server:8081/internal/oauth/callback
+      --token-endpoint-auth-method client_secret_post
+    depends_on:
+      - hydra
+    restart: on-failure
+
+  # ─── Go Auth Server ─────────────────────────────────────────────────────────
 
   auth-server:
     build: .
@@ -27,10 +119,30 @@ services:
     depends_on:
       - redis
       - postgres
+      - kratos
+      - hydra
     env_file:
       - ./env/.env
     environment:
-      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      REDIS_ADDR: ${REDIS_ADDR}
+      REDIS_ADDR: redis:6379
+      KRATOS_PUBLIC_URL: http://kratos:4433
+      KRATOS_ADMIN_URL: http://kratos:4434
+      HYDRA_PUBLIC_URL: http://hydra:4444
+      HYDRA_ADMIN_URL: http://hydra:4445
     restart: always
+
+  # ─── Monitoring ─────────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: central-auth-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: always
+
+volumes:
+  postgres-data:
