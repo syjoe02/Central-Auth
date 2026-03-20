@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"central-auth/internal/blacklist"
 	"central-auth/internal/config"
 	hydraclient "central-auth/internal/hydra"
 	"central-auth/internal/http/handler"
@@ -12,6 +16,7 @@ import (
 	_ "central-auth/internal/metrics"
 	"central-auth/internal/repository"
 	"central-auth/internal/service"
+	"central-auth/internal/session"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -25,6 +30,9 @@ func main() {
 
 	// ── Ory configuration ────────────────────────────────────────────────────
 	oryConfig := config.LoadOryConfig()
+
+	// ── BFF configuration ────────────────────────────────────────────────────
+	bffConfig := config.LoadBFFConfig()
 
 	// ── Redis ────────────────────────────────────────────────────────────────
 	rdb := config.NewRedisClient()
@@ -56,15 +64,27 @@ func main() {
 		oryConfig.HydraClientID,
 		oryConfig.HydraClientSecret,
 		oryConfig.HydraRedirectURI,
+		hydraclient.WithGracePeriod(bffConfig.JWKSGracePeriod),
+		// Validate iss and aud on every JWT so tokens from other Hydra instances
+		// or clients are rejected even when a key matches. (Security finding F-1)
+		hydraclient.WithExpectedIssuer(oryConfig.HydraPublicURL+"/"),
+		hydraclient.WithExpectedAudience(oryConfig.HydraClientID),
 	)
 
-	// ── Service ──────────────────────────────────────────────────────────────
+	// ── S2S auth service (existing /auth/* endpoints) ─────────────────────────
 	authService := service.NewInstrumentedAuthService(
 		service.NewOryAuthService(hydraClient, redisRepo, deviceSessionRepo),
 	)
 
-	// ── Handler ──────────────────────────────────────────────────────────────
+	// ── BFF session layer ─────────────────────────────────────────────────────
+	sessionStore := session.NewRedisStore(rdb, bffConfig.SessionTTL)
+	bl := blacklist.NewRedisBlacklist(rdb)
+	bffService := service.NewBFFService(hydraClient, sessionStore, bl, redisRepo, deviceSessionRepo, bffConfig)
+
+	// ── Handlers ──────────────────────────────────────────────────────────────
 	authHandler := handler.NewAuthHandler(authService)
+	bffHandler := handler.NewBFFHandler(bffService, bffConfig)
+	adminHandler := handler.NewAdminHandler(hydraClient)
 
 	// ── Router ───────────────────────────────────────────────────────────────
 	r := gin.Default()
@@ -77,6 +97,7 @@ func main() {
 	})
 	r.Use(middleware.PrometheusMiddleware())
 
+	// ── S2S routes (existing Django integration, unchanged) ───────────────────
 	auth := r.Group("/auth")
 	auth.Use(middleware.ServiceAuthMiddleware())
 	{
@@ -87,7 +108,45 @@ func main() {
 		auth.POST("/verify", authHandler.Verify)
 	}
 
-	fmt.Println("Central-Auth server running on :8081 (Ory Kratos + Hydra backend)")
+	// ── BFF routes (browser cookie-based) ─────────────────────────────────────
+	bff := r.Group("/bff")
+	{
+		// Login has no session middleware (creates the session).
+		bff.POST("/login", middleware.RateLimitMiddleware(), bffHandler.Login)
+
+		// All other BFF routes require a valid __session cookie + CSRF token.
+		protected := bff.Group("")
+		protected.Use(middleware.BFFSessionMiddleware())
+		protected.Use(middleware.CSRFMiddleware(bffConfig.CSRFSecret))
+		{
+			protected.POST("/logout", bffHandler.Logout)
+			protected.POST("/logout-all", bffHandler.LogoutAll)
+			protected.GET("/whoami", bffHandler.WhoAmI)
+		}
+	}
+
+	// ── Admin routes (X-Service-Key protected) ────────────────────────────────
+	admin := r.Group("/admin")
+	admin.Use(middleware.ServiceAuthMiddleware())
+	{
+		admin.POST("/jwks/refresh", adminHandler.RefreshJWKS)
+	}
+
+	// ── SIGHUP: zero-downtime JWKS key rotation trigger ───────────────────────
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGHUP)
+		for range sigs {
+			log.Println("[INFO] SIGHUP received: forcing JWKS cache refresh")
+			if err := hydraClient.ForceRefreshJWKS(context.Background()); err != nil {
+				log.Printf("[ERROR] JWKS force refresh failed: %v", err)
+			} else {
+				log.Println("[INFO] JWKS cache refreshed successfully")
+			}
+		}
+	}()
+
+	fmt.Println("Central-Auth server running on :8081 (BFF + Ory Kratos/Hydra backend)")
 	if err := r.Run(":8081"); err != nil {
 		log.Fatalf("server exited: %v", err)
 	}
