@@ -3,157 +3,151 @@ package service_test
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
 	"central-auth/internal/domain"
+	"central-auth/internal/hydra"
 	"central-auth/internal/service"
-	"central-auth/internal/token"
 )
 
-// ---- helpers ----------------------------------------------------------------
+// ── Mock: HydraClient ────────────────────────────────────────────────────────
 
-func TestMain(m *testing.M) {
-	os.Setenv("JWT_SECRET", "test-secret-that-is-at-least-32-chars!!")
-	token.InitSecret()
-	os.Exit(m.Run())
-}
-
-func makeRefreshToken(userID, deviceID string, ttl time.Duration) string {
-	tok, err := token.Generate(userID, deviceID, token.TypeRefresh, ttl)
-	if err != nil {
-		panic(err)
-	}
-	return tok
+type mockHydraClient struct {
+	issueTokensFunc       func(ctx context.Context, kratosID, deviceID string, rememberMe bool) (*hydra.TokenSet, error)
+	refreshTokenFunc      func(ctx context.Context, refreshToken string) (*hydra.TokenSet, error)
+	revokeTokenFunc       func(ctx context.Context, token string) error
+	revokeAllFunc         func(ctx context.Context, kratosID string) error
+	introspectFunc        func(ctx context.Context, token string) (*hydra.IntrospectResult, error)
+	validateAccessFunc    func(ctx context.Context, token string) (*hydra.AccessTokenClaims, error)
 }
 
-// ---- mock RedisRepo ---------------------------------------------------------
-
-type mockRedis struct {
-	saveLoginFn          func(ctx context.Context, userID, deviceID, tok string, ttl time.Duration) error
-	existsRefreshFn      func(ctx context.Context, userID, deviceID string) (bool, error)
-	validateRefreshFn    func(ctx context.Context, userID, deviceID, tok string) (bool, error)
-	rotateRefreshFn      func(ctx context.Context, userID, deviceID, newTok string, ttl time.Duration) error
-	logoutDeviceFn       func(ctx context.Context, userID, deviceID string) error
-	logoutAllFn          func(ctx context.Context, userID string) error
+func (m *mockHydraClient) IssueTokens(ctx context.Context, kratosID, deviceID string, rememberMe bool) (*hydra.TokenSet, error) {
+	return m.issueTokensFunc(ctx, kratosID, deviceID, rememberMe)
+}
+func (m *mockHydraClient) RefreshToken(ctx context.Context, token string) (*hydra.TokenSet, error) {
+	return m.refreshTokenFunc(ctx, token)
+}
+func (m *mockHydraClient) RevokeToken(ctx context.Context, token string) error {
+	return m.revokeTokenFunc(ctx, token)
+}
+func (m *mockHydraClient) RevokeAllForSubject(ctx context.Context, kratosID string) error {
+	return m.revokeAllFunc(ctx, kratosID)
+}
+func (m *mockHydraClient) IntrospectToken(ctx context.Context, token string) (*hydra.IntrospectResult, error) {
+	return m.introspectFunc(ctx, token)
+}
+func (m *mockHydraClient) ValidateAccessToken(ctx context.Context, token string) (*hydra.AccessTokenClaims, error) {
+	return m.validateAccessFunc(ctx, token)
 }
 
-func (m *mockRedis) SaveLogin(ctx context.Context, userID, deviceID, tok string, ttl time.Duration) error {
-	if m.saveLoginFn != nil {
-		return m.saveLoginFn(ctx, userID, deviceID, tok, ttl)
-	}
-	return nil
-}
-func (m *mockRedis) ExistsRefreshToken(ctx context.Context, userID, deviceID string) (bool, error) {
-	if m.existsRefreshFn != nil {
-		return m.existsRefreshFn(ctx, userID, deviceID)
-	}
-	return true, nil
-}
-func (m *mockRedis) ValidateRefreshToken(ctx context.Context, userID, deviceID, tok string) (bool, error) {
-	if m.validateRefreshFn != nil {
-		return m.validateRefreshFn(ctx, userID, deviceID, tok)
-	}
-	return true, nil
-}
-func (m *mockRedis) RotateRefreshToken(ctx context.Context, userID, deviceID, newTok string, ttl time.Duration) error {
-	if m.rotateRefreshFn != nil {
-		return m.rotateRefreshFn(ctx, userID, deviceID, newTok, ttl)
-	}
-	return nil
-}
-func (m *mockRedis) LogoutDevice(ctx context.Context, userID, deviceID string) error {
-	if m.logoutDeviceFn != nil {
-		return m.logoutDeviceFn(ctx, userID, deviceID)
-	}
-	return nil
-}
-func (m *mockRedis) LogoutAll(ctx context.Context, userID string) error {
-	if m.logoutAllFn != nil {
-		return m.logoutAllFn(ctx, userID)
-	}
-	return nil
+// ── Mock: RedisRepo ──────────────────────────────────────────────────────────
+
+type mockRedisRepo struct {
+	saveLoginFunc           func(ctx context.Context, kratosID, deviceID, token string, ttl time.Duration) error
+	getDeviceRefreshFunc    func(ctx context.Context, kratosID, deviceID string) (string, error)
+	rotateRefreshTokenFunc  func(ctx context.Context, kratosID, deviceID, newToken string, ttl time.Duration) error
+	logoutDeviceFunc        func(ctx context.Context, kratosID, deviceID string) error
+	logoutAllFunc           func(ctx context.Context, kratosID string) error
 }
 
-// ---- mock AuthUserRepository ------------------------------------------------
-
-type mockUserRepo struct {
-	findByProviderFn    func(ctx context.Context, provider, providerID string) (*domain.AuthUser, error)
-	saveFn              func(ctx context.Context, user *domain.AuthUser) error
-	saveRefreshFn       func(ctx context.Context, tok *domain.RefreshToken) error
-	updateHashFn        func(ctx context.Context, userID, deviceID, hash string) error
-	updateLastUsedFn    func(ctx context.Context, userID, deviceID string) error
-	revokeDeviceFn      func(ctx context.Context, userID, deviceID string) error
-	revokeAllFn         func(ctx context.Context, userID string) error
-	getLoginDevicesFn   func(ctx context.Context, userID string) ([]domain.LoginDeviceInfo, error)
-	countActiveDevFn    func(ctx context.Context, userID string) (int, error)
+func (m *mockRedisRepo) SaveLogin(ctx context.Context, kratosID, deviceID, token string, ttl time.Duration) error {
+	return m.saveLoginFunc(ctx, kratosID, deviceID, token, ttl)
+}
+func (m *mockRedisRepo) GetDeviceRefreshToken(ctx context.Context, kratosID, deviceID string) (string, error) {
+	return m.getDeviceRefreshFunc(ctx, kratosID, deviceID)
+}
+func (m *mockRedisRepo) RotateRefreshToken(ctx context.Context, kratosID, deviceID, newToken string, ttl time.Duration) error {
+	return m.rotateRefreshTokenFunc(ctx, kratosID, deviceID, newToken, ttl)
+}
+func (m *mockRedisRepo) LogoutDevice(ctx context.Context, kratosID, deviceID string) error {
+	return m.logoutDeviceFunc(ctx, kratosID, deviceID)
+}
+func (m *mockRedisRepo) LogoutAll(ctx context.Context, kratosID string) error {
+	return m.logoutAllFunc(ctx, kratosID)
 }
 
-func (m *mockUserRepo) FindByProvider(ctx context.Context, provider, providerID string) (*domain.AuthUser, error) {
-	if m.findByProviderFn != nil {
-		return m.findByProviderFn(ctx, provider, providerID)
-	}
+// ── Mock: DeviceSessionRepository ───────────────────────────────────────────
+
+type mockDeviceSessionRepo struct {
+	saveDeviceSessionFunc   func(ctx context.Context, session *domain.DeviceSession) error
+	updateLastUsedAtFunc    func(ctx context.Context, kratosID, deviceID string) error
+	revokeDeviceFunc        func(ctx context.Context, kratosID, deviceID string) error
+	revokeAllDevicesFunc    func(ctx context.Context, kratosID string) error
+	getDeviceSessionsFunc   func(ctx context.Context, kratosID string) ([]domain.DeviceSession, error)
+	countActiveDevicesFunc  func(ctx context.Context, kratosID string) (int, error)
+}
+
+func (m *mockDeviceSessionRepo) SaveDeviceSession(ctx context.Context, session *domain.DeviceSession) error {
+	return m.saveDeviceSessionFunc(ctx, session)
+}
+func (m *mockDeviceSessionRepo) UpdateLastUsedAt(ctx context.Context, kratosID, deviceID string) error {
+	return m.updateLastUsedAtFunc(ctx, kratosID, deviceID)
+}
+func (m *mockDeviceSessionRepo) RevokeDevice(ctx context.Context, kratosID, deviceID string) error {
+	return m.revokeDeviceFunc(ctx, kratosID, deviceID)
+}
+func (m *mockDeviceSessionRepo) RevokeAllDevices(ctx context.Context, kratosID string) error {
+	return m.revokeAllDevicesFunc(ctx, kratosID)
+}
+func (m *mockDeviceSessionRepo) GetDeviceSessions(ctx context.Context, kratosID string) ([]domain.DeviceSession, error) {
+	return m.getDeviceSessionsFunc(ctx, kratosID)
+}
+func (m *mockDeviceSessionRepo) CountActiveDevices(ctx context.Context, kratosID string) (int, error) {
+	return m.countActiveDevicesFunc(ctx, kratosID)
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+func noopSaveSession(ctx context.Context, _ *domain.DeviceSession) error    { return nil }
+func noopUpdateLastUsed(ctx context.Context, _, _ string) error             { return nil }
+func noopRevokeDevice(ctx context.Context, _, _ string) error               { return nil }
+func noopRevokeAll(ctx context.Context, _ string) error                     { return nil }
+func noopGetSessions(ctx context.Context, _ string) ([]domain.DeviceSession, error) {
 	return nil, nil
 }
-func (m *mockUserRepo) Save(ctx context.Context, user *domain.AuthUser) error {
-	if m.saveFn != nil {
-		return m.saveFn(ctx, user)
+func noopCountActive(ctx context.Context, _ string) (int, error) { return 0, nil }
+
+func noopSaveLogin(ctx context.Context, _, _, _ string, _ time.Duration) error { return nil }
+func noopRotate(ctx context.Context, _, _, _ string, _ time.Duration) error    { return nil }
+func noopLogoutDevice(ctx context.Context, _, _ string) error                  { return nil }
+func noopLogoutAll(ctx context.Context, _ string) error                        { return nil }
+func noopGetRefresh(ctx context.Context, _, _ string) (string, error)          { return "", nil }
+
+func goodTokens() *hydra.TokenSet {
+	return &hydra.TokenSet{
+		AccessToken:  "access.token.jwt",
+		RefreshToken: "opaque-refresh-token",
+		TokenType:    "bearer",
+		ExpiresIn:    900,
 	}
-	return nil
-}
-func (m *mockUserRepo) SaveRefreshToken(ctx context.Context, tok *domain.RefreshToken) error {
-	if m.saveRefreshFn != nil {
-		return m.saveRefreshFn(ctx, tok)
-	}
-	return nil
-}
-func (m *mockUserRepo) UpdateTokenHash(ctx context.Context, userID, deviceID, hash string) error {
-	if m.updateHashFn != nil {
-		return m.updateHashFn(ctx, userID, deviceID, hash)
-	}
-	return nil
-}
-func (m *mockUserRepo) UpdateLastUsedAt(ctx context.Context, userID, deviceID string) error {
-	if m.updateLastUsedFn != nil {
-		return m.updateLastUsedFn(ctx, userID, deviceID)
-	}
-	return nil
-}
-func (m *mockUserRepo) RevokeDevice(ctx context.Context, userID, deviceID string) error {
-	if m.revokeDeviceFn != nil {
-		return m.revokeDeviceFn(ctx, userID, deviceID)
-	}
-	return nil
-}
-func (m *mockUserRepo) RevokeAllDevices(ctx context.Context, userID string) error {
-	if m.revokeAllFn != nil {
-		return m.revokeAllFn(ctx, userID)
-	}
-	return nil
-}
-func (m *mockUserRepo) GetLoginDevices(ctx context.Context, userID string) ([]domain.LoginDeviceInfo, error) {
-	if m.getLoginDevicesFn != nil {
-		return m.getLoginDevicesFn(ctx, userID)
-	}
-	return nil, nil
-}
-func (m *mockUserRepo) CountActiveDevices(ctx context.Context, userID string) (int, error) {
-	if m.countActiveDevFn != nil {
-		return m.countActiveDevFn(ctx, userID)
-	}
-	return 0, nil
 }
 
-// ---- Login ------------------------------------------------------------------
+func goodClaims(kratosID, deviceID string) *hydra.AccessTokenClaims {
+	return &hydra.AccessTokenClaims{
+		Subject: kratosID,
+		Ext:     map[string]interface{}{"device_id": deviceID},
+	}
+}
+
+// ── Test: Login ──────────────────────────────────────────────────────────────
 
 func TestLogin_HappyPath(t *testing.T) {
-	svc := service.NewAuthService(&mockRedis{}, &mockUserRepo{})
-	ctx := context.Background()
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, kratosID, deviceID string, rememberMe bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+	}
+	r := &mockRedisRepo{saveLoginFunc: noopSaveLogin}
+	d := &mockDeviceSessionRepo{
+		saveDeviceSessionFunc: noopSaveSession,
+	}
 
-	access, refresh, err := svc.Login(ctx, "user-1", "device-1", false, nil, nil)
+	svc := service.NewOryAuthService(h, r, d)
+	access, refresh, err := svc.Login(context.Background(), "kratos-id-1", "device-1", false, nil, nil)
+
 	if err != nil {
-		t.Fatalf("Login: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if access == "" || refresh == "" {
 		t.Fatal("expected non-empty tokens")
@@ -161,437 +155,323 @@ func TestLogin_HappyPath(t *testing.T) {
 }
 
 func TestLogin_RememberMe_UsesLongTTL(t *testing.T) {
-	var capturedTTL time.Duration
-	redis := &mockRedis{
-		saveLoginFn: func(_ context.Context, _, _, _ string, ttl time.Duration) error {
-			capturedTTL = ttl
+	var savedTTL time.Duration
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+	}
+	r := &mockRedisRepo{
+		saveLoginFunc: func(_ context.Context, _, _, _ string, ttl time.Duration) error {
+			savedTTL = ttl
 			return nil
 		},
 	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
+	d := &mockDeviceSessionRepo{saveDeviceSessionFunc: noopSaveSession}
 
-	_, _, err := svc.Login(context.Background(), "u", "d", true, nil, nil)
+	svc := service.NewOryAuthService(h, r, d)
+	_, _, err := svc.Login(context.Background(), "k1", "d1", true, nil, nil)
 	if err != nil {
-		t.Fatalf("Login: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if capturedTTL != service.RefreshTTLLong {
-		t.Errorf("expected TTL %v, got %v", service.RefreshTTLLong, capturedTTL)
+	if savedTTL != service.RefreshTTLLong {
+		t.Errorf("expected RefreshTTLLong (%v), got %v", service.RefreshTTLLong, savedTTL)
+	}
+}
+
+func TestLogin_HydraError_ReturnsError(t *testing.T) {
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return nil, errors.New("hydra: network error")
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	_, _, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
 }
 
 func TestLogin_RedisError_ReturnsError(t *testing.T) {
-	sentinel := errors.New("redis down")
-	redis := &mockRedis{
-		saveLoginFn: func(_ context.Context, _, _, _ string, _ time.Duration) error {
-			return sentinel
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
 		},
 	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	_, _, err := svc.Login(context.Background(), "u", "d", false, nil, nil)
-	if err == nil {
-		t.Fatal("expected error")
+	r := &mockRedisRepo{
+		saveLoginFunc: func(_ context.Context, _, _, _ string, _ time.Duration) error {
+			return errors.New("redis: connection refused")
+		},
 	}
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
+	svc := service.NewOryAuthService(h, r, &mockDeviceSessionRepo{})
+	_, _, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil)
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
 }
 
-func TestLogin_PostgresError_ReturnsError(t *testing.T) {
-	sentinel := errors.New("pg down")
-	userRepo := &mockUserRepo{
-		saveRefreshFn: func(_ context.Context, _ *domain.RefreshToken) error {
-			return sentinel
-		},
-	}
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	_, _, err := svc.Login(context.Background(), "u", "d", false, nil, nil)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-// ---- Logout -----------------------------------------------------------------
+// ── Test: Logout ─────────────────────────────────────────────────────────────
 
 func TestLogout_HappyPath(t *testing.T) {
-	ctx := context.Background()
-	tok := makeRefreshToken("user-1", "device-1", time.Minute)
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return &hydra.IntrospectResult{
+				Active:  true,
+				Subject: "kratos-id-1",
+				Ext:     map[string]interface{}{"device_id": "device-1"},
+			}, nil
+		},
+		revokeTokenFunc: func(_ context.Context, _ string) error { return nil },
+	}
+	r := &mockRedisRepo{logoutDeviceFunc: noopLogoutDevice}
+	d := &mockDeviceSessionRepo{revokeDeviceFunc: noopRevokeDevice}
 
-	svc := service.NewAuthService(&mockRedis{}, &mockUserRepo{})
-	if err := svc.Logout(ctx, tok); err != nil {
-		t.Fatalf("Logout: %v", err)
+	svc := service.NewOryAuthService(h, r, d)
+	if err := svc.Logout(context.Background(), "opaque-refresh-token"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func TestLogout_ExpiredToken_StillSucceeds(t *testing.T) {
-	ctx := context.Background()
-	tok := makeRefreshToken("user-1", "device-1", -time.Second)
-
-	svc := service.NewAuthService(&mockRedis{}, &mockUserRepo{})
-	if err := svc.Logout(ctx, tok); err != nil {
-		t.Fatalf("Logout with expired token: %v", err)
+func TestLogout_InactiveToken_ReturnsErrInvalidToken(t *testing.T) {
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return &hydra.IntrospectResult{Active: false}, nil
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	err := svc.Logout(context.Background(), "bad-token")
+	if !errors.Is(err, service.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
 	}
 }
 
-func TestLogout_InvalidToken_ReturnsError(t *testing.T) {
-	svc := service.NewAuthService(&mockRedis{}, &mockUserRepo{})
-	err := svc.Logout(context.Background(), "not-a-token")
-	if err == nil {
-		t.Fatal("expected error for invalid token")
+func TestLogout_IntrospectError_ReturnsErrInvalidToken(t *testing.T) {
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return nil, errors.New("hydra: introspect failed")
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	err := svc.Logout(context.Background(), "bad-token")
+	if !errors.Is(err, service.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
 	}
 }
 
-// ---- LogoutAll --------------------------------------------------------------
-
-func TestLogoutAll_ExpiredToken_StillSucceeds(t *testing.T) {
-	ctx := context.Background()
-	tok := makeRefreshToken("user-1", "device-1", -time.Second)
-
-	svc := service.NewAuthService(&mockRedis{}, &mockUserRepo{})
-	if err := svc.LogoutAll(ctx, tok); err != nil {
-		t.Fatalf("LogoutAll with expired token: %v", err)
+func TestLogout_MissingDeviceID_ReturnsErrInvalidToken(t *testing.T) {
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return &hydra.IntrospectResult{Active: true, Subject: "k1"}, nil // no device_id
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	err := svc.Logout(context.Background(), "token")
+	if !errors.Is(err, service.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
 	}
 }
 
-// ---- Refresh ----------------------------------------------------------------
+func TestLogout_RedisFailure_IsNonFatal(t *testing.T) {
+	// Redis cleanup failure should NOT cause Logout to return an error
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return &hydra.IntrospectResult{
+				Active:  true,
+				Subject: "k1",
+				Ext:     map[string]interface{}{"device_id": "d1"},
+			}, nil
+		},
+		revokeTokenFunc: func(_ context.Context, _ string) error { return nil },
+	}
+	r := &mockRedisRepo{
+		logoutDeviceFunc: func(_ context.Context, _, _ string) error {
+			return errors.New("redis: connection refused")
+		},
+	}
+	d := &mockDeviceSessionRepo{revokeDeviceFunc: noopRevokeDevice}
+
+	svc := service.NewOryAuthService(h, r, d)
+	if err := svc.Logout(context.Background(), "token"); err != nil {
+		t.Fatalf("Redis failure should be non-fatal, got: %v", err)
+	}
+}
+
+// ── Test: LogoutAll ──────────────────────────────────────────────────────────
+
+func TestLogoutAll_HappyPath(t *testing.T) {
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return &hydra.IntrospectResult{Active: true, Subject: "k1"}, nil
+		},
+		revokeAllFunc: func(_ context.Context, _ string) error { return nil },
+	}
+	r := &mockRedisRepo{logoutAllFunc: noopLogoutAll}
+	d := &mockDeviceSessionRepo{revokeAllDevicesFunc: noopRevokeAll}
+
+	svc := service.NewOryAuthService(h, r, d)
+	if err := svc.LogoutAll(context.Background(), "token"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLogoutAll_InactiveToken_ReturnsErrInvalidToken(t *testing.T) {
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return &hydra.IntrospectResult{Active: false}, nil
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	err := svc.LogoutAll(context.Background(), "bad-token")
+	if !errors.Is(err, service.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
+	}
+}
+
+func TestLogoutAll_HydraRevokeAllError_ReturnsError(t *testing.T) {
+	h := &mockHydraClient{
+		introspectFunc: func(_ context.Context, _ string) (*hydra.IntrospectResult, error) {
+			return &hydra.IntrospectResult{Active: true, Subject: "k1"}, nil
+		},
+		revokeAllFunc: func(_ context.Context, _ string) error {
+			return errors.New("hydra: admin API down")
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	if err := svc.LogoutAll(context.Background(), "token"); err == nil {
+		t.Fatal("expected error from Hydra revoke-all failure")
+	}
+}
+
+// ── Test: Refresh ────────────────────────────────────────────────────────────
 
 func TestRefresh_HappyPath(t *testing.T) {
-	ctx := context.Background()
-	original := makeRefreshToken("u", "d", time.Hour)
-
-	redis := &mockRedis{
-		validateRefreshFn: func(_ context.Context, _, _, tok string) (bool, error) {
-			return tok == original, nil
+	newTokens := &hydra.TokenSet{AccessToken: "new.access.jwt", RefreshToken: "new-refresh", ExpiresIn: 900}
+	h := &mockHydraClient{
+		refreshTokenFunc: func(_ context.Context, _ string) (*hydra.TokenSet, error) {
+			return newTokens, nil
+		},
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return &hydra.AccessTokenClaims{
+				Subject: "k1",
+				Ext:     map[string]interface{}{"device_id": "d1"},
+			}, nil
 		},
 	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
+	r := &mockRedisRepo{rotateRefreshTokenFunc: noopRotate}
+	d := &mockDeviceSessionRepo{updateLastUsedAtFunc: noopUpdateLastUsed}
 
-	newAccess, newRefresh, err := svc.Refresh(ctx, original)
+	svc := service.NewOryAuthService(h, r, d)
+	access, refresh, err := svc.Refresh(context.Background(), "old-refresh")
 	if err != nil {
-		t.Fatalf("Refresh: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if newAccess == "" || newRefresh == "" {
-		t.Fatal("expected non-empty new tokens")
-	}
-	// Verify the new tokens are valid and correctly typed
-	if _, err := token.ParseTyped(newAccess, token.TypeAccess); err != nil {
-		t.Errorf("new access token invalid: %v", err)
-	}
-	if _, err := token.ParseTyped(newRefresh, token.TypeRefresh); err != nil {
-		t.Errorf("new refresh token invalid: %v", err)
+	if access != newTokens.AccessToken || refresh != newTokens.RefreshToken {
+		t.Errorf("token mismatch: got access=%q refresh=%q", access, refresh)
 	}
 }
 
-func TestRefresh_InvalidToken_ReturnsError(t *testing.T) {
-	svc := service.NewAuthService(&mockRedis{}, &mockUserRepo{})
-	_, _, err := svc.Refresh(context.Background(), "bad-token")
+func TestRefresh_HydraError_ReturnsErrInvalidToken(t *testing.T) {
+	h := &mockHydraClient{
+		refreshTokenFunc: func(_ context.Context, _ string) (*hydra.TokenSet, error) {
+			return nil, errors.New("hydra: invalid refresh token")
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	_, _, err := svc.Refresh(context.Background(), "bad-refresh")
+	if !errors.Is(err, service.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got %v", err)
+	}
+}
+
+func TestRefresh_RedisRotateFailure_IsNonFatal(t *testing.T) {
+	h := &mockHydraClient{
+		refreshTokenFunc: func(_ context.Context, _ string) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return &hydra.AccessTokenClaims{
+				Subject: "k1",
+				Ext:     map[string]interface{}{"device_id": "d1"},
+			}, nil
+		},
+	}
+	r := &mockRedisRepo{
+		rotateRefreshTokenFunc: func(_ context.Context, _, _, _ string, _ time.Duration) error {
+			return errors.New("redis: down")
+		},
+	}
+	d := &mockDeviceSessionRepo{updateLastUsedAtFunc: noopUpdateLastUsed}
+
+	svc := service.NewOryAuthService(h, r, d)
+	_, _, err := svc.Refresh(context.Background(), "refresh")
+	if err != nil {
+		t.Fatalf("Redis failure should be non-fatal, got: %v", err)
+	}
+}
+
+// ── Test: VerifyToken ────────────────────────────────────────────────────────
+
+func TestVerifyToken_HappyPath(t *testing.T) {
+	h := &mockHydraClient{
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			exp := time.Now().Add(15 * time.Minute)
+			claims := &hydra.AccessTokenClaims{
+				Subject: "kratos-id-1",
+				Ext:     map[string]interface{}{"device_id": "device-1"},
+			}
+			_ = exp
+			return claims, nil
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	result, err := svc.VerifyToken(context.Background(), "access.jwt")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.KratosID != "kratos-id-1" {
+		t.Errorf("expected KratosID=kratos-id-1, got %q", result.KratosID)
+	}
+	if result.DeviceID != "device-1" {
+		t.Errorf("expected DeviceID=device-1, got %q", result.DeviceID)
+	}
+}
+
+func TestVerifyToken_InvalidJWT_ReturnsFail(t *testing.T) {
+	h := &mockHydraClient{
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return nil, errors.New("hydra: invalid signature")
+		},
+	}
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	_, err := svc.VerifyToken(context.Background(), "bad.jwt")
 	if err == nil {
-		t.Fatal("expected error for invalid token")
+		t.Fatal("expected error for invalid JWT")
 	}
 }
 
-func TestRefresh_TokenNotInRedis_ReturnsError(t *testing.T) {
-	ctx := context.Background()
-	tok := makeRefreshToken("u", "d", time.Hour)
-
-	redis := &mockRedis{
-		validateRefreshFn: func(_ context.Context, _, _, _ string) (bool, error) {
-			return false, nil // not found / revoked
+func TestVerifyToken_JWKSUnavailable_FailClosed(t *testing.T) {
+	// Fail-closed: even if Hydra JWKS endpoint is down, Verify returns an error (→ 401)
+	h := &mockHydraClient{
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return nil, errors.New("hydra: JWKS fetch failed: connection refused")
 		},
 	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	_, _, err := svc.Refresh(ctx, tok)
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	_, err := svc.VerifyToken(context.Background(), "some.jwt")
 	if err == nil {
-		t.Fatal("expected error when token not in Redis")
+		t.Fatal("expected error when JWKS unavailable (fail-closed)")
 	}
 }
 
-// ---- OAuthLogin -------------------------------------------------------------
-
-func TestOAuthLogin_NewUser(t *testing.T) {
-	userRepo := &mockUserRepo{
-		findByProviderFn: func(_ context.Context, _, _ string) (*domain.AuthUser, error) {
-			return nil, nil // user does not exist yet
+func TestVerifyToken_MissingDeviceID_ReturnsFail(t *testing.T) {
+	h := &mockHydraClient{
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return &hydra.AccessTokenClaims{Subject: "k1"}, nil // no device_id in Ext
 		},
 	}
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	access, refresh, err := svc.OAuthLogin(
-		context.Background(), "google", "provider-123", "test@example.com",
-		"device-1", false, nil, nil,
-	)
-	if err != nil {
-		t.Fatalf("OAuthLogin: %v", err)
-	}
-	if access == "" || refresh == "" {
-		t.Fatal("expected non-empty tokens")
-	}
-}
-
-func TestOAuthLogin_ExistingUser(t *testing.T) {
-	existing := &domain.AuthUser{
-		UserID: "existing-uid", Provider: "google", ProviderID: "p-123", Email: "x@x.com",
-	}
-	saveCalled := false
-	userRepo := &mockUserRepo{
-		findByProviderFn: func(_ context.Context, _, _ string) (*domain.AuthUser, error) {
-			return existing, nil
-		},
-		saveFn: func(_ context.Context, _ *domain.AuthUser) error {
-			saveCalled = true
-			return nil
-		},
-	}
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	_, _, err := svc.OAuthLogin(
-		context.Background(), "google", "p-123", "x@x.com",
-		"d", false, nil, nil,
-	)
-	if err != nil {
-		t.Fatalf("OAuthLogin: %v", err)
-	}
-	if saveCalled {
-		t.Error("Save should not be called for an existing user")
-	}
-}
-
-func TestOAuthLogin_FindByProviderError(t *testing.T) {
-	sentinel := errors.New("db error")
-	userRepo := &mockUserRepo{
-		findByProviderFn: func(_ context.Context, _, _ string) (*domain.AuthUser, error) {
-			return nil, sentinel
-		},
-	}
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	_, _, err := svc.OAuthLogin(
-		context.Background(), "google", "p", "e", "d", false, nil, nil,
-	)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestOAuthLogin_SaveUserError(t *testing.T) {
-	sentinel := errors.New("save failed")
-	userRepo := &mockUserRepo{
-		findByProviderFn: func(_ context.Context, _, _ string) (*domain.AuthUser, error) {
-			return nil, nil
-		},
-		saveFn: func(_ context.Context, _ *domain.AuthUser) error {
-			return sentinel
-		},
-	}
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	_, _, err := svc.OAuthLogin(
-		context.Background(), "google", "p", "e", "d", false, nil, nil,
-	)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestOAuthLogin_RedisError(t *testing.T) {
-	sentinel := errors.New("redis error")
-	redis := &mockRedis{
-		saveLoginFn: func(_ context.Context, _, _, _ string, _ time.Duration) error {
-			return sentinel
-		},
-	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	_, _, err := svc.OAuthLogin(
-		context.Background(), "google", "p", "e", "d", false, nil, nil,
-	)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-// ---- Logout error paths -----------------------------------------------------
-
-func TestLogout_RedisError(t *testing.T) {
-	sentinel := errors.New("redis error")
-	redis := &mockRedis{
-		logoutDeviceFn: func(_ context.Context, _, _ string) error {
-			return sentinel
-		},
-	}
-	tok := makeRefreshToken("u", "d", time.Minute)
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	err := svc.Logout(context.Background(), tok)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestLogout_PostgresError(t *testing.T) {
-	sentinel := errors.New("pg error")
-	userRepo := &mockUserRepo{
-		revokeDeviceFn: func(_ context.Context, _, _ string) error {
-			return sentinel
-		},
-	}
-	tok := makeRefreshToken("u", "d", time.Minute)
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	err := svc.Logout(context.Background(), tok)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestLogoutAll_RedisError(t *testing.T) {
-	sentinel := errors.New("redis error")
-	redis := &mockRedis{
-		logoutAllFn: func(_ context.Context, _ string) error {
-			return sentinel
-		},
-	}
-	tok := makeRefreshToken("u", "d", time.Minute)
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	err := svc.LogoutAll(context.Background(), tok)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestLogoutAll_PostgresError(t *testing.T) {
-	sentinel := errors.New("pg error")
-	userRepo := &mockUserRepo{
-		revokeAllFn: func(_ context.Context, _ string) error {
-			return sentinel
-		},
-	}
-	tok := makeRefreshToken("u", "d", time.Minute)
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	err := svc.LogoutAll(context.Background(), tok)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestLogoutAll_InvalidToken_ReturnsError(t *testing.T) {
-	svc := service.NewAuthService(&mockRedis{}, &mockUserRepo{})
-	err := svc.LogoutAll(context.Background(), "not-a-token")
+	svc := service.NewOryAuthService(h, &mockRedisRepo{}, &mockDeviceSessionRepo{})
+	_, err := svc.VerifyToken(context.Background(), "jwt")
 	if err == nil {
-		t.Fatal("expected error for invalid token")
-	}
-}
-
-// ---- Refresh error paths ----------------------------------------------------
-
-func TestRefresh_ValidateRedisError(t *testing.T) {
-	sentinel := errors.New("redis error")
-	original := makeRefreshToken("u", "d", time.Hour)
-
-	redis := &mockRedis{
-		validateRefreshFn: func(_ context.Context, _, _, _ string) (bool, error) {
-			return false, sentinel
-		},
-	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	_, _, err := svc.Refresh(context.Background(), original)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestRefresh_RotateError(t *testing.T) {
-	sentinel := errors.New("rotate error")
-	original := makeRefreshToken("u", "d", time.Hour)
-
-	redis := &mockRedis{
-		validateRefreshFn: func(_ context.Context, _, _, _ string) (bool, error) {
-			return true, nil
-		},
-		rotateRefreshFn: func(_ context.Context, _, _, _ string, _ time.Duration) error {
-			return sentinel
-		},
-	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	_, _, err := svc.Refresh(context.Background(), original)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-func TestRefresh_UpdateHashError(t *testing.T) {
-	sentinel := errors.New("pg error")
-	original := makeRefreshToken("u", "d", time.Hour)
-
-	userRepo := &mockUserRepo{
-		updateHashFn: func(_ context.Context, _, _, _ string) error {
-			return sentinel
-		},
-	}
-	svc := service.NewAuthService(&mockRedis{}, userRepo)
-
-	_, _, err := svc.Refresh(context.Background(), original)
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
-	}
-}
-
-// ---- ExistsSession ----------------------------------------------------------
-
-func TestExistsSession_Exists(t *testing.T) {
-	redis := &mockRedis{
-		existsRefreshFn: func(_ context.Context, _, _ string) (bool, error) {
-			return true, nil
-		},
-	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	exists, err := svc.ExistsSession(context.Background(), "u", "d")
-	if err != nil {
-		t.Fatalf("ExistsSession: %v", err)
-	}
-	if !exists {
-		t.Error("expected session to exist")
-	}
-}
-
-func TestExistsSession_NotExists(t *testing.T) {
-	redis := &mockRedis{
-		existsRefreshFn: func(_ context.Context, _, _ string) (bool, error) {
-			return false, nil
-		},
-	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	exists, err := svc.ExistsSession(context.Background(), "u", "d")
-	if err != nil {
-		t.Fatalf("ExistsSession: %v", err)
-	}
-	if exists {
-		t.Error("expected session to not exist")
-	}
-}
-
-func TestExistsSession_RedisError(t *testing.T) {
-	sentinel := errors.New("redis down")
-	redis := &mockRedis{
-		existsRefreshFn: func(_ context.Context, _, _ string) (bool, error) {
-			return false, sentinel
-		},
-	}
-	svc := service.NewAuthService(redis, &mockUserRepo{})
-
-	_, err := svc.ExistsSession(context.Background(), "u", "d")
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected wrapped sentinel, got: %v", err)
+		t.Fatal("expected error for missing device_id claim")
 	}
 }
