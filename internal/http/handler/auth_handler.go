@@ -8,24 +8,21 @@ import (
 
 	"central-auth/internal/model"
 	"central-auth/internal/service"
-	"central-auth/internal/token"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 )
 
+// AuthHandler handles all /auth/* endpoints using the Ory-backed AuthServiceI.
 type AuthHandler struct {
-	authService    service.AuthServiceI
-	googleClientID string
+	authService service.AuthServiceI
 }
 
-func NewAuthHandler(authService service.AuthServiceI, googleClientID string) *AuthHandler {
-	if googleClientID == "" {
-		panic("GOOGLE_CLIENT_ID env var must be set")
-	}
-	return &AuthHandler{authService: authService, googleClientID: googleClientID}
+// NewAuthHandler creates a new AuthHandler.
+func NewAuthHandler(authService service.AuthServiceI) *AuthHandler {
+	return &AuthHandler{authService: authService}
 }
 
+// bearerToken extracts the Bearer token from the Authorization header.
 func bearerToken(c *gin.Context) (string, bool) {
 	h := c.GetHeader("Authorization")
 	if h == "" {
@@ -38,18 +35,14 @@ func bearerToken(c *gin.Context) (string, bool) {
 	return parts[1], true
 }
 
-// isTokenError returns true for errors caused by the caller (bad/expired/wrong-type token).
-// Returns false for infrastructure failures (Redis, Postgres) which should be 500.
+// isTokenError returns true for errors that should map to HTTP 401 rather than 500.
 func isTokenError(err error) bool {
-	return errors.Is(err, token.ErrWrongTokenType) ||
-		errors.Is(err, jwt.ErrTokenMalformed) ||
-		errors.Is(err, jwt.ErrTokenSignatureInvalid) ||
-		errors.Is(err, jwt.ErrTokenUnverifiable) ||
-		errors.Is(err, jwt.ErrTokenExpired) ||
-		errors.Is(err, jwt.ErrTokenNotValidYet) ||
-		errors.Is(err, jwt.ErrTokenInvalidClaims)
+	return errors.Is(err, service.ErrInvalidToken)
 }
 
+// Login handles POST /auth/login.
+// The caller (e.g. Django) has already authenticated the user and passes the
+// Kratos identity ID as "user_id" in the JSON body.
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req model.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -60,8 +53,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	userAgent := c.GetHeader("User-Agent")
 	ip := c.ClientIP()
 
-	var uaPtr *string
-	var ipPtr *string
+	var uaPtr, ipPtr *string
 	if userAgent != "" {
 		uaPtr = &userAgent
 	}
@@ -71,7 +63,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	access, refresh, err := h.authService.Login(
 		c.Request.Context(),
-		req.UserID,
+		req.KratosID,
 		req.DeviceID,
 		req.RememberMe,
 		uaPtr,
@@ -89,6 +81,8 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	})
 }
 
+// Logout handles POST /auth/logout.
+// Expects Authorization: Bearer <hydra-refresh-token>.
 func (h *AuthHandler) Logout(c *gin.Context) {
 	refreshToken, ok := bearerToken(c)
 	if !ok {
@@ -109,6 +103,8 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"result": "logged_out"})
 }
 
+// LogoutAll handles POST /auth/logout-all.
+// Expects Authorization: Bearer <hydra-refresh-token>.
 func (h *AuthHandler) LogoutAll(c *gin.Context) {
 	refreshToken, ok := bearerToken(c)
 	if !ok {
@@ -129,6 +125,37 @@ func (h *AuthHandler) LogoutAll(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"result": "logged_out_all"})
 }
 
+// Refresh handles POST /auth/refresh.
+// Expects Authorization: Bearer <hydra-refresh-token>.
+// Returns a new access+refresh token pair.
+func (h *AuthHandler) Refresh(c *gin.Context) {
+	refreshToken, ok := bearerToken(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing or invalid Authorization header"})
+		return
+	}
+
+	accessToken, newRefreshToken, err := h.authService.Refresh(c.Request.Context(), refreshToken)
+	if err != nil {
+		if isTokenError(err) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "refresh_failed", "error_code": "token_invalid", "reason": err.Error()})
+		} else {
+			log.Printf("Refresh error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "refresh_failed", "error_code": "server_error"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, model.LoginResponse{
+		AccessToken:  accessToken,
+		RefreshToken: newRefreshToken,
+	})
+}
+
+// Verify handles POST /auth/verify.
+// Expects Authorization: Bearer <hydra-access-token>.
+// Validates the JWT locally via Hydra's JWKS — no Hydra round-trip on the hot path.
+// Fail-closed: any validation error returns 401.
 func (h *AuthHandler) Verify(c *gin.Context) {
 	tokenStr, ok := bearerToken(c)
 	if !ok {
@@ -136,23 +163,16 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 		return
 	}
 
-	// ParseTyped enforces token_type = "access" — refresh tokens are rejected here
-	claims, err := token.ParseTyped(tokenStr, token.TypeAccess)
+	// Fail-closed: any error → 401 (same behaviour as the previous Redis ExistsSession check)
+	result, err := h.authService.VerifyToken(c.Request.Context(), tokenStr)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 		return
 	}
 
-	// Fail closed: Redis failure returns 401, not 500 — deny access on uncertainty
-	exists, err := h.authService.ExistsSession(c.Request.Context(), claims.UserID, claims.DeviceID)
-	if err != nil || !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "session expired"})
-		return
-	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":   claims.UserID,
-		"device_id": claims.DeviceID,
-		"exp":       claims.ExpiresAt.Time.Unix(),
+		"user_id":   result.KratosID,
+		"device_id": result.DeviceID,
+		"exp":       result.ExpiresAt,
 	})
 }
