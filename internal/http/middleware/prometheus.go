@@ -15,7 +15,10 @@ func PrometheusMiddleware() gin.HandlerFunc {
 		start := time.Now()
 		path := c.FullPath()
 		if path == "" {
-			path = c.Request.URL.Path
+			// Security fix M-6: using the raw URL path as a label causes unbounded
+			// Prometheus cardinality — every unique scanner probe creates a new
+			// time series that is never garbage-collected. Use a fixed label instead.
+			path = "unmatched"
 		}
 
 		c.Next()

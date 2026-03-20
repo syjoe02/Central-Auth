@@ -67,8 +67,10 @@ func (rs *RedisStore) Create(ctx context.Context, s BFFSession) error {
 	pipe.SAdd(ctx, userSessionsKey(s.KratosID), s.SessionID)
 	// Keep the user index key alive as long as the longest session.
 	pipe.Expire(ctx, userSessionsKey(s.KratosID), ttl)
-	_, err = pipe.Exec(ctx)
-	return err
+	if _, err = pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("session store: create pipeline: %w", err)
+	}
+	return nil
 }
 
 // Get retrieves a session by sessionID. Returns ErrNotFound if missing or expired.
@@ -115,26 +117,46 @@ func (rs *RedisStore) Delete(ctx context.Context, sessionID string) error {
 	pipe := rs.rdb.TxPipeline()
 	pipe.Del(ctx, sessionKey(sessionID))
 	pipe.SRem(ctx, userSessionsKey(s.KratosID), sessionID)
-	_, err = pipe.Exec(ctx)
-	return err
+	if _, err = pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("session store: delete pipeline: %w", err)
+	}
+	return nil
 }
 
 // GetAllForUser returns all live sessions for the given kratosID.
 // Stale index entries (sessions whose keys have expired) are silently skipped.
+// Uses a single Redis pipeline round-trip instead of N sequential GETs.
 func (rs *RedisStore) GetAllForUser(ctx context.Context, kratosID string) ([]BFFSession, error) {
 	sessionIDs, err := rs.rdb.SMembers(ctx, userSessionsKey(kratosID)).Result()
 	if err != nil {
 		return nil, fmt.Errorf("session store: list user sessions: %w", err)
 	}
+	if len(sessionIDs) == 0 {
+		return nil, nil
+	}
+
+	// Fetch all session JSON values in a single pipeline round-trip (M-5).
+	pipe := rs.rdb.Pipeline()
+	cmds := make([]*redis.StringCmd, len(sessionIDs))
+	for i, id := range sessionIDs {
+		cmds[i] = pipe.Get(ctx, sessionKey(id))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("session store: get all pipeline: %w", err)
+	}
 
 	var sessions []BFFSession
-	for _, id := range sessionIDs {
-		s, err := rs.Get(ctx, id)
-		if errors.Is(err, ErrNotFound) {
+	for _, cmd := range cmds {
+		val, err := cmd.Result()
+		if errors.Is(err, redis.Nil) {
 			continue // expired; stale index entry
 		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("session store: get all pipeline result: %w", err)
+		}
+		var s BFFSession
+		if err := json.Unmarshal([]byte(val), &s); err != nil {
+			return nil, fmt.Errorf("session store: unmarshal: %w", err)
 		}
 		sessions = append(sessions, s)
 	}

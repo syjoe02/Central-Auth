@@ -77,7 +77,7 @@ func (b *RedisBlacklist) AddBatch(ctx context.Context, sessionIDs []string, ttl 
 	if len(sessionIDs) == 0 || ttl <= 0 {
 		return nil
 	}
-	pipe := b.rdb.Pipeline()
+	pipe := b.rdb.TxPipeline()
 	for _, id := range sessionIDs {
 		pipe.Set(ctx, blacklistKey(id), "1", ttl)
 	}

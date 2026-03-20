@@ -376,7 +376,7 @@ func (s *BFFService) WhoAmI(ctx context.Context, sessionID string) (string, stri
 func randomSessionID() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return "", err
+		return "", fmt.Errorf("random session id: %w", err)
 	}
 	return fmt.Sprintf("%x", b), nil
 }
