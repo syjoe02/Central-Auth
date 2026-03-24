@@ -297,7 +297,7 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 	}
 	resp1.Body.Close()
 
-	loginChallenge, err := extractParam(resp1.Header.Get("Location"), "login_challenge")
+	loginChallenge, err := extractRawParam(resp1.Header.Get("Location"), "login_challenge")
 	if err != nil {
 		return nil, fmt.Errorf("hydra: extract login_challenge: %w", err)
 	}
@@ -325,15 +325,22 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 	}
 	resp3.Body.Close()
 
-	consentChallenge, err := extractParam(resp3.Header.Get("Location"), "consent_challenge")
+	consentChallenge, err := extractRawParam(resp3.Header.Get("Location"), "consent_challenge")
 	if err != nil {
 		return nil, fmt.Errorf("hydra: extract consent_challenge: %w", err)
 	}
 
 	// ── Step 4: Accept consent (embed device_id in ext claims) ──────────────
+	// Use the explicitly configured JWT audience so the aud claim at issuance
+	// matches what ValidateAccessToken checks. Falls back to clientID when
+	// WithExpectedAudience was not called (backward compatibility).
+	consentAudience := c.expectedAudience
+	if consentAudience == "" {
+		consentAudience = c.clientID
+	}
 	consentAcceptBody := map[string]interface{}{
 		"grant_scope":                 []string{"openid", "offline_access", "email", "profile"},
-		"grant_access_token_audience": []string{c.clientID},
+		"grant_access_token_audience": []string{consentAudience},
 		"remember":                    rememberMe,
 		"remember_for":                rememberFor,
 		"session": map[string]interface{}{
@@ -660,6 +667,31 @@ func extractParam(rawURL, param string) (string, error) {
 		return "", fmt.Errorf("param %q not found in redirect URL: %s", param, rawURL)
 	}
 	return v, nil
+}
+
+// extractRawParam extracts the raw (URL-encoded) value of a query parameter from
+// rawURL without any URL-decoding. This preserves the exact bytes Hydra placed in
+// the Location header so they can be forwarded to the admin API verbatim.
+func extractRawParam(rawURL, param string) (string, error) {
+	if rawURL == "" {
+		return "", fmt.Errorf("empty redirect URL when extracting %q", param)
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parse redirect URL: %w", err)
+	}
+	raw := u.RawQuery
+	for _, kv := range strings.Split(raw, "&") {
+		prefix := param + "="
+		if strings.HasPrefix(kv, prefix) {
+			val := kv[len(prefix):]
+			if val == "" {
+				return "", fmt.Errorf("param %q is empty in redirect URL: %s", param, rawURL)
+			}
+			return val, nil
+		}
+	}
+	return "", fmt.Errorf("param %q not found in redirect URL: %s", param, rawURL)
 }
 
 func randomHex(n int) (string, error) {
