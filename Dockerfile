@@ -17,5 +17,6 @@ WORKDIR /app
 COPY --from=builder /app/central-auth .
 
 EXPOSE 8081
+EXPOSE 9091
 
 CMD ["./central-auth"]

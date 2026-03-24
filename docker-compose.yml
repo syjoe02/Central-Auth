@@ -10,7 +10,7 @@ services:
     image: postgres:16-alpine
     container_name: central-auth-postgres
     env_file:
-      - ./env/.env
+      - ./env/.env.prod
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -20,7 +20,16 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     restart: always
+
+  # Kafka is provided by the shared Hackonomics-Infra stack on shared-monitor-net.
+  # auth-server connects to kafka:9092 via that network — no local broker needed.
 
   # ─── Ory Kratos: Identity Management ───────────────────────────────────────
 
@@ -31,7 +40,8 @@ services:
       DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/kratos?sslmode=disable
     command: migrate sql -e --yes
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: on-failure
 
   kratos:
@@ -39,7 +49,8 @@ services:
     container_name: central-auth-kratos
     ports:
       - "4433:4433" # public
-      - "4434:4434" # admin
+    expose:
+      - "4434"      # admin — internal only, never routed to host
     environment:
       DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/kratos?sslmode=disable
       SECRETS_COOKIE: ${KRATOS_COOKIE_SECRET}
@@ -64,7 +75,8 @@ services:
       DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable
     command: migrate sql -e --yes
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: on-failure
 
   hydra:
@@ -72,11 +84,13 @@ services:
     container_name: central-auth-hydra
     ports:
       - "4444:4444" # public (OAuth2 endpoints)
-      - "4445:4445" # admin
+    expose:
+      - "4445"      # admin — internal only, never routed to host
+    command: serve all --dev
     environment:
       DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable
       SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET}
-      URLS_SELF_ISSUER: http://hydra:4444/
+      URLS_SELF_ISSUER: http://localhost:4444/
       URLS_LOGIN: http://auth-server:8081/hydra/login
       URLS_CONSENT: http://auth-server:8081/hydra/consent
       URLS_LOGOUT: http://auth-server:8081/hydra/logout
@@ -85,6 +99,12 @@ services:
       STRATEGIES_ACCESS_TOKEN: jwt
       TTL_ACCESS_TOKEN: 15m
       TTL_REFRESH_TOKEN: 720h # 30 days; short sessions enforced via Redis device TTL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4445/health/ready || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
     depends_on:
       - hydra-migrate
     restart: always
@@ -96,18 +116,19 @@ services:
     environment:
       HYDRA_ADMIN_URL: http://hydra:4445
     command: >
-      clients create
+      create oauth2-client
       --endpoint http://hydra:4445
       --id ${HYDRA_CLIENT_ID}
       --secret ${HYDRA_CLIENT_SECRET}
-      --grant-types authorization_code,refresh_token,client_credentials
-      --response-types code,id_token
+      --grant-type authorization_code,refresh_token,client_credentials
+      --response-type code,id_token
       --scope openid,offline_access,email,profile
-      --redirect-uris http://auth-server:8081/internal/oauth/callback
+      --redirect-uri http://auth-server:8081/internal/oauth/callback
       --token-endpoint-auth-method client_secret_post
     depends_on:
-      - hydra
-    restart: on-failure
+      hydra:
+        condition: service_healthy
+    restart: "no"
 
   # ─── Go Auth Server ─────────────────────────────────────────────────────────
 
@@ -116,13 +137,19 @@ services:
     container_name: central-auth-server
     ports:
       - "8081:8081"
+    expose:
+      - "9091"
     depends_on:
-      - redis
-      - postgres
-      - kratos
-      - hydra
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      kratos:
+        condition: service_started
+      hydra:
+        condition: service_healthy
     env_file:
-      - ./env/.env
+      - ./env/.env.prod
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
@@ -131,18 +158,19 @@ services:
       KRATOS_ADMIN_URL: http://kratos:4434
       HYDRA_PUBLIC_URL: http://hydra:4444
       HYDRA_ADMIN_URL: http://hydra:4445
-    restart: always
-
-  # ─── Monitoring ─────────────────────────────────────────────────────────────
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: central-auth-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      METRICS_ALLOWED_CIDR: "${METRICS_ALLOWED_CIDR:-172.20.0.0/16}"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_TOPIC: "access-logs"
+    networks:
+      default: {}
+      shared-monitor-net:
+        aliases:
+          - auth-server
     restart: always
 
 volumes:
   postgres-data:
+
+networks:
+  shared-monitor-net:
+    external: true

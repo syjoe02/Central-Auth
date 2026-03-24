@@ -9,9 +9,9 @@ scrape_configs:
       - targets:
           - host.docker.internal:8000   # adjust to your Django server port
 
-  # Go central-auth service metrics
+  # Go central-auth service metrics (scraped via shared-monitor-net)
   - job_name: central-auth
     static_configs:
       - targets:
-          - host.docker.internal:8081
+          - auth-server:9091
     metrics_path: /metrics
