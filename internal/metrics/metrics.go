@@ -97,6 +97,13 @@ var (
 		Name: "central_auth_bff_csrf_rejected_total",
 		Help: "Total requests rejected by the CSRF middleware.",
 	})
+
+	// KafkaEventsDropped counts access-log events dropped because the internal
+	// producer channel was full (Kafka slow or unreachable).
+	KafkaEventsDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_kafka_events_dropped_total",
+		Help: "Total access-log events dropped due to full Kafka producer channel.",
+	})
 )
 
 func init() {
@@ -113,5 +120,6 @@ func init() {
 		BFFTokenRefreshes,
 		BFFJWKSDeprecatedKidUsed,
 		BFFCSRFRejected,
+		KafkaEventsDropped,
 	)
 }
