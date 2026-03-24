@@ -21,11 +21,11 @@ type BFFConfig struct {
 func LoadBFFConfig() BFFConfig {
 	csrfSecret := os.Getenv("BFF_CSRF_SECRET")
 	if csrfSecret == "" {
-		panic("BFF_CSRF_SECRET env var must be set")
+		log.Fatalf("[FATAL] BFF_CSRF_SECRET env var must be set")
 	}
 	cookieDomain := os.Getenv("BFF_COOKIE_DOMAIN")
 	if cookieDomain == "" {
-		panic("BFF_COOKIE_DOMAIN env var must be set")
+		log.Fatalf("[FATAL] BFF_COOKIE_DOMAIN env var must be set")
 	}
 
 	secure := true
@@ -49,7 +49,7 @@ func LoadBFFConfig() BFFConfig {
 		}
 	}
 	if gracePeriod > maxGracePeriod {
-		panic("BFF_JWKS_GRACE_PERIOD exceeds maximum allowed value of 2h — check for misconfiguration")
+		log.Fatalf("[FATAL] BFF_JWKS_GRACE_PERIOD exceeds maximum allowed value of 2h — check for misconfiguration")
 	}
 
 	refreshBuffer := 60 * time.Second
