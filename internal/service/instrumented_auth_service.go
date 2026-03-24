@@ -73,4 +73,28 @@ func (s *InstrumentedAuthService) VerifyToken(ctx context.Context, accessToken s
 	return result, err
 }
 
+func (s *InstrumentedAuthService) LoginWithPassword(ctx context.Context, email, password, deviceID string, rememberMe bool, userAgent, ip *string) (string, string, error) {
+	start := time.Now()
+	access, refresh, err := s.delegate.LoginWithPassword(ctx, email, password, deviceID, rememberMe, userAgent, ip)
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	metrics.AuthOps.WithLabelValues("login_with_password", result).Inc()
+	metrics.OryOps.WithLabelValues("kratos_authenticate").Observe(time.Since(start).Seconds())
+	return access, refresh, err
+}
+
+func (s *InstrumentedAuthService) Signup(ctx context.Context, email, password string) (string, error) {
+	start := time.Now()
+	id, err := s.delegate.Signup(ctx, email, password)
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	metrics.AuthOps.WithLabelValues("signup", result).Inc()
+	metrics.OryOps.WithLabelValues("kratos_create_identity").Observe(time.Since(start).Seconds())
+	return id, err
+}
+
 var _ AuthServiceI = (*InstrumentedAuthService)(nil)

@@ -1,10 +1,14 @@
 package model
 
 // LoginRequest is the body for POST /auth/login.
-// KratosID is the Ory Kratos identity.id of the already-authenticated user.
-// The json tag "user_id" is kept for backward compatibility with Django's integration.
+// Accepts either email+password credentials (delegated to Kratos for verification)
+// or a pre-authenticated KratosID passed directly as user_id.
 type LoginRequest struct {
-	KratosID   string `json:"user_id"  binding:"required"`
+	// Email+password path (used by Django integration)
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	// Pre-authenticated Kratos ID path (legacy / internal use)
+	KratosID   string `json:"user_id"`
 	DeviceID   string `json:"device_id" binding:"required"`
 	RememberMe bool   `json:"remember_me"`
 }
@@ -32,4 +36,16 @@ type BFFStatusResponse struct {
 type WhoAmIResponse struct {
 	KratosID string `json:"kratos_id"`
 	DeviceID string `json:"device_id"`
+}
+
+// SignupRequest is the body for POST /auth/signup.
+type SignupRequest struct {
+	Email    string `json:"email"    binding:"required,email"`
+	Password string `json:"password" binding:"required"`
+}
+
+// SignupResponse is the successful response from POST /auth/signup.
+type SignupResponse struct {
+	OryID string `json:"ory_id"`
+	Email string `json:"email"`
 }

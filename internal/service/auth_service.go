@@ -9,6 +9,7 @@ import (
 
 	"central-auth/internal/domain"
 	"central-auth/internal/hydra"
+	"central-auth/internal/kratos"
 	"central-auth/internal/repository"
 )
 
@@ -20,6 +21,12 @@ const (
 // ErrInvalidToken is returned by the service for token errors that should map
 // to HTTP 401 on the caller side (bad token, expired, wrong type).
 var ErrInvalidToken = errors.New("invalid or expired token")
+
+// ErrEmailConflict is returned by Signup when the email is already registered.
+var ErrEmailConflict = errors.New("email already registered")
+
+// ErrInvalidCredentials is returned by LoginWithPassword when the credentials are wrong.
+var ErrInvalidCredentials = errors.New("invalid credentials")
 
 // VerifyResult holds the validated claims extracted from a Hydra access token.
 type VerifyResult struct {
@@ -35,6 +42,10 @@ type AuthServiceI interface {
 	// The caller (e.g. Django) has already verified the user's credentials.
 	Login(ctx context.Context, kratosID, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
 
+	// LoginWithPassword authenticates the user against Kratos, then issues Hydra tokens.
+	// This is the primary path used by the Django integration.
+	LoginWithPassword(ctx context.Context, email, password, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
+
 	// Logout revokes the session identified by the given Hydra refresh token.
 	Logout(ctx context.Context, refreshToken string) error
 
@@ -47,6 +58,11 @@ type AuthServiceI interface {
 	// VerifyToken validates a Hydra access token JWT and returns its claims.
 	// Fail-closed: any error (invalid signature, expired, JWKS unavailable) returns a non-nil error.
 	VerifyToken(ctx context.Context, accessToken string) (*VerifyResult, error)
+
+	// Signup creates a new Kratos identity with the given email and password.
+	// Returns the new Kratos identity UUID. Returns ErrEmailConflict if the
+	// email is already registered.
+	Signup(ctx context.Context, email, password string) (kratosID string, err error)
 }
 
 // OryAuthService implements AuthServiceI using Ory Hydra for token management
@@ -55,6 +71,15 @@ type OryAuthService struct {
 	hydra             hydra.ClientI
 	redisRepo         repository.RedisRepo
 	deviceSessionRepo repository.DeviceSessionRepository
+	kratosClient      kratos.ClientI
+}
+
+// OryAuthServiceOption is a functional option for OryAuthService.
+type OryAuthServiceOption func(*OryAuthService)
+
+// WithKratosClient sets the Kratos admin client used by the Signup method.
+func WithKratosClient(c kratos.ClientI) OryAuthServiceOption {
+	return func(s *OryAuthService) { s.kratosClient = c }
 }
 
 // NewOryAuthService creates a new OryAuthService.
@@ -62,12 +87,17 @@ func NewOryAuthService(
 	hydraClient hydra.ClientI,
 	redisRepo repository.RedisRepo,
 	deviceSessionRepo repository.DeviceSessionRepository,
+	opts ...OryAuthServiceOption,
 ) *OryAuthService {
-	return &OryAuthService{
+	s := &OryAuthService{
 		hydra:             hydraClient,
 		redisRepo:         redisRepo,
 		deviceSessionRepo: deviceSessionRepo,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Login issues Hydra tokens for a Kratos identity.
@@ -82,7 +112,7 @@ func (s *OryAuthService) Login(
 	rememberMe bool,
 	userAgent, ip *string,
 ) (string, string, error) {
-	log.Printf("[AUTH] Login start kratosID=%s device=%s", kratosID, deviceID)
+	log.Printf("[AUTH] Login start kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
 
 	tokens, err := s.hydra.IssueTokens(ctx, kratosID, deviceID, rememberMe)
 	if err != nil {
@@ -113,7 +143,7 @@ func (s *OryAuthService) Login(
 		return "", "", fmt.Errorf("login: save device session: %w", err)
 	}
 
-	log.Printf("[AUTH] Login success kratosID=%s device=%s", kratosID, deviceID)
+	log.Printf("[AUTH] Login success kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
 	return tokens.AccessToken, tokens.RefreshToken, nil
 }
 
@@ -139,7 +169,7 @@ func (s *OryAuthService) Logout(ctx context.Context, refreshToken string) error 
 	kratosID := introspect.Subject
 	deviceID := introspect.DeviceID()
 	if kratosID == "" || deviceID == "" {
-		log.Printf("[ERROR] Logout: missing claims kratosID=%q deviceID=%q", kratosID, deviceID)
+		log.Printf("[ERROR] Logout: missing claims kratosID=%s deviceID=%s", maskID(kratosID), maskID(deviceID))
 		return fmt.Errorf("%w: missing subject or device_id in token", ErrInvalidToken)
 	}
 
@@ -156,7 +186,7 @@ func (s *OryAuthService) Logout(ctx context.Context, refreshToken string) error 
 		log.Printf("[WARN] logout: Postgres revoke failed (non-fatal): %v", err)
 	}
 
-	log.Printf("[AUTH] Logout success kratosID=%s device=%s", kratosID, deviceID)
+	log.Printf("[AUTH] Logout success kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
 	return nil
 }
 
@@ -197,7 +227,7 @@ func (s *OryAuthService) LogoutAll(ctx context.Context, refreshToken string) err
 		log.Printf("[WARN] logout all: Postgres revoke failed (non-fatal): %v", err)
 	}
 
-	log.Printf("[AUTH] LogoutAll success kratosID=%s", kratosID)
+	log.Printf("[AUTH] LogoutAll success kratosID=%s", maskID(kratosID))
 	return nil
 }
 
@@ -235,7 +265,7 @@ func (s *OryAuthService) Refresh(ctx context.Context, refreshToken string) (stri
 		log.Printf("[WARN] refresh: Postgres update last_used_at failed (non-fatal): %v", err)
 	}
 
-	log.Printf("[AUTH] Refresh success kratosID=%s device=%s", kratosID, deviceID)
+	log.Printf("[AUTH] Refresh success kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
 	return tokens.AccessToken, tokens.RefreshToken, nil
 }
 
@@ -259,6 +289,56 @@ func (s *OryAuthService) VerifyToken(ctx context.Context, accessToken string) (*
 		DeviceID:  deviceID,
 		ExpiresAt: exp,
 	}, nil
+}
+
+// maskID truncates an identifier to its first 8 characters for safe log output.
+// Full UUIDs (e.g. Kratos identities) must not appear in logs in production.
+func maskID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8] + "..."
+}
+
+// LoginWithPassword authenticates the user via Kratos self-service, then issues Hydra tokens.
+// This is the primary path for the Django integration (email+password login).
+func (s *OryAuthService) LoginWithPassword(
+	ctx context.Context,
+	email, password, deviceID string,
+	rememberMe bool,
+	userAgent, ip *string,
+) (string, string, error) {
+	if s.kratosClient == nil {
+		return "", "", fmt.Errorf("login_with_password: Kratos client not configured")
+	}
+	kratosID, err := s.kratosClient.AuthenticatePassword(ctx, email, password)
+	if err != nil {
+		if errors.Is(err, kratos.ErrInvalidCredentials) {
+			return "", "", ErrInvalidCredentials
+		}
+		log.Printf("[ERROR] Kratos AuthenticatePassword failed: %v", err)
+		return "", "", fmt.Errorf("login_with_password: authenticate: %w", err)
+	}
+	return s.Login(ctx, kratosID, deviceID, rememberMe, userAgent, ip)
+}
+
+// Signup creates a new Kratos identity with the given email and password.
+// Returns the Kratos identity UUID on success. Returns ErrEmailConflict if the
+// email is already registered.
+func (s *OryAuthService) Signup(ctx context.Context, email, password string) (string, error) {
+	if s.kratosClient == nil {
+		return "", fmt.Errorf("signup: Kratos client not configured")
+	}
+	id, err := s.kratosClient.CreateIdentity(ctx, email, password)
+	if err != nil {
+		if errors.Is(err, kratos.ErrEmailConflict) {
+			return "", ErrEmailConflict
+		}
+		log.Printf("[ERROR] Kratos CreateIdentity failed: %v", err)
+		return "", fmt.Errorf("signup: create identity: %w", err)
+	}
+	log.Printf("[AUTH] Signup success kratosID=%s", maskID(id))
+	return id, nil
 }
 
 // compile-time interface check

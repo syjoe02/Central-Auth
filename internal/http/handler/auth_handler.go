@@ -41,8 +41,9 @@ func isTokenError(err error) bool {
 }
 
 // Login handles POST /auth/login.
-// The caller (e.g. Django) has already authenticated the user and passes the
-// Kratos identity ID as "user_id" in the JSON body.
+// Accepts two forms:
+//   - Email+password: {"email","password","device_id","remember_me"} — authenticates via Kratos
+//   - Pre-authenticated: {"user_id","device_id","remember_me"} — issues tokens directly (legacy)
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req model.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -52,7 +53,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	userAgent := c.GetHeader("User-Agent")
 	ip := c.ClientIP()
-
 	var uaPtr, ipPtr *string
 	if userAgent != "" {
 		uaPtr = &userAgent
@@ -61,17 +61,39 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		ipPtr = &ip
 	}
 
-	access, refresh, err := h.authService.Login(
-		c.Request.Context(),
-		req.KratosID,
-		req.DeviceID,
-		req.RememberMe,
-		uaPtr,
-		ipPtr,
-	)
-	if err != nil {
-		log.Printf("Login error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+	var access, refresh string
+	var err error
+
+	if req.Email != "" && req.Password != "" {
+		// Email+password path: authenticate via Kratos, then issue Hydra tokens.
+		access, refresh, err = h.authService.LoginWithPassword(
+			c.Request.Context(),
+			req.Email, req.Password, req.DeviceID, req.RememberMe,
+			uaPtr, ipPtr,
+		)
+		if err != nil {
+			if errors.Is(err, service.ErrInvalidCredentials) {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+				return
+			}
+			log.Printf("Login error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
+		}
+	} else if req.KratosID != "" {
+		// Pre-authenticated path: caller already has a Kratos ID.
+		access, refresh, err = h.authService.Login(
+			c.Request.Context(),
+			req.KratosID, req.DeviceID, req.RememberMe,
+			uaPtr, ipPtr,
+		)
+		if err != nil {
+			log.Printf("Login error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+			return
+		}
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provide either email+password or user_id"})
 		return
 	}
 
@@ -149,6 +171,33 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	c.JSON(http.StatusOK, model.LoginResponse{
 		AccessToken:  accessToken,
 		RefreshToken: newRefreshToken,
+	})
+}
+
+// Signup handles POST /auth/signup.
+// Creates a new Kratos identity and returns its UUID.
+// Returns 409 if the email is already registered.
+func (h *AuthHandler) Signup(c *gin.Context) {
+	var req model.SignupRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	kratosID, err := h.authService.Signup(c.Request.Context(), req.Email, req.Password)
+	if err != nil {
+		if errors.Is(err, service.ErrEmailConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})
+			return
+		}
+		log.Printf("Signup error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, model.SignupResponse{
+		OryID: kratosID,
+		Email: req.Email,
 	})
 }
 
