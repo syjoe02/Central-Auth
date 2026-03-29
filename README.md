@@ -109,32 +109,32 @@ sequenceDiagram
     participant Redis
     participant PG as Postgres
 
-    Note over Browser,PG: Phase 1 — BFF Login  POST /bff/login
+    Note over Browser,PG: Phase 1 - BFF Login POST /bff/login
     Browser->>GW: POST /bff/login {email, password}
     GW->>Kratos: submitLoginFlow(identifier, password)
     Kratos-->>GW: kratosSessionToken
-    GW->>Hydra: client_credentials → access_token + refresh_token
+    GW->>Hydra: client_credentials -> access_token + refresh_token
     GW->>Redis: SET session:{hex64} {kratosID, tokens, deviceID, TTL=168h}
     GW->>PG: SaveDeviceSession(kratosID, deviceID, userAgent, IP)
-    GW-->>Browser: "200 OK · Set-Cookie: __session=<hex64>; HttpOnly; Secure; SameSite=Lax · X-CSRF-Token: <hmac>"
+    GW-->>Browser: "200 OK - Set-Cookie: __session=<hex64> HttpOnly Secure SameSite=Lax"
 
-    Note over Browser,PG: Phase 2 — Protected BFF Call  POST /bff/logout
-    Browser->>GW: POST /bff/logout · Cookie: __session=… · X-CSRF-Token: …
-    GW->>GW: BFFSessionMiddleware — validate __session (64-char hex)
-    GW->>GW: CSRFMiddleware — HMAC verify X-CSRF-Token
-    GW->>Redis: GET session:{id} → kratosID + accessToken
+    Note over Browser,PG: Phase 2 - Protected BFF Call (POST /bff/logout)
+    Browser->>GW: POST /bff/logout - Cookie: __session=...
+    GW->>GW: BFFSessionMiddleware - validate session
+    GW->>GW: CSRFMiddleware - HMAC verify
+    GW->>Redis: GET session:{id}
     GW->>Hydra: revokeToken(accessToken)
-    GW->>Redis: blacklist.Revoke(jti) · DEL session:{id}
+    GW->>Redis: blacklist.Revoke(jti)
     GW->>PG: RevokeDevice(kratosID, deviceID)
-    GW-->>Browser: "204 No Content · Set-Cookie: __session=; Max-Age=0"
+    GW-->>Browser: "204 No Content - Set-Cookie: __session= Max-Age=0"
 
-    Note over Browser,PG: Phase 3 — Proxied API Call  GET /api/dashboard
-    Browser->>GW: GET /api/dashboard · Authorization: Bearer <access_token>
-    GW->>GW: ProxyHandler — extractBearerToken(header ∥ access_token cookie)
+    Note over Browser,PG: Phase 3 - Proxied API Call (GET /api/dashboard)
+    Browser->>GW: GET /api/dashboard - Authorization: Bearer <token>
+    GW->>GW: ProxyHandler - extract token (header or cookie)
     GW->>GW: Del X-User-ID (spoof prevention)
-    GW->>Hydra: ValidateAccessToken — local JWKS verify (cached, 0 RTT hot path)
-    GW->>GW: Set X-User-ID: <sub> · Set Authorization: Bearer <token>
-    GW->>Django: GET /api/dashboard · Bearer + X-User-ID
+    GW->>Hydra: ValidateAccessToken - local JWKS verify
+    GW->>GW: Set X-User-ID: sub
+    GW->>Django: GET /api/dashboard - Bearer + X-User-ID
     Django-->>GW: 200 JSON
     GW-->>Browser: 200 JSON (proxied)
 ```
@@ -492,18 +492,18 @@ Kafka access-log publishing is fully asynchronous — the HTTP response is sent 
 
 The following findings from the pre-merge security review are resolved in the current codebase:
 
-| ID | Severity | Finding | Status |
-|----|:---:|---------|--------|
-| C-1 | Critical | Compiled `server` binary not excluded from git | Fixed — `/server` added to `.gitignore` |
-| H-2 | High | `X-User-ID` not stripped on auth-free proxy paths | Fixed — `Header.Del("X-User-ID")` before any auth check in `ProxyHandler` |
-| M-2 | Medium | `c.ClientIP()` trusted without proxy CIDR config (XFF spoofing) | Fixed — `r.SetTrustedProxies(serverConfig.TrustedProxyCIDRs)` in `main.go` |
+| Severity | Finding | Status |
+|---|---------|--------|
+| Critical | Compiled `server` binary not excluded from git | Fixed — `/server` added to `.gitignore` |
+| High | `X-User-ID` not stripped on auth-free proxy paths | Fixed — `Header.Del("X-User-ID")` before any auth check in `ProxyHandler` |
+| Medium | `c.ClientIP()` trusted without proxy CIDR config (XFF spoofing) | Fixed — `r.SetTrustedProxies(serverConfig.TrustedProxyCIDRs)` in `main.go` |
 
 Tracked / acknowledged findings (dev environment only — must be resolved before production deploy):
 
-| ID | Severity | Finding | Action required |
-|----|:---:|---------|-----------------|
-| H-1 | High | `DJANGO_URL` scheme not validated (SSRF from env misconfiguration) | Add scheme + host allowlist in `LoadProxyConfig()` |
-| H-3 | High | Kratos/Hydra DSNs use `sslmode=disable` in docker-compose | Change to `sslmode=require` for production compose file |
-| H-4 | High | Kratos and Hydra started with `--dev` flag | Remove `--dev` and configure explicitly for production |
-| M-1 | Medium | Kratos CORS `allowed_origins: ["*"]` | Restrict to explicit origin list before production |
-| M-3 | Medium | `changeme` OAuth placeholder in `kratos/kratos.yml` | Replace with `INJECTED_VIA_ENV` sentinel to fail fast on misconfiguration |
+| Severity | Finding | Action required |
+|----|---------|-----------------|
+| High | `DJANGO_URL` scheme not validated (SSRF from env misconfiguration) | Add scheme + host allowlist in `LoadProxyConfig()` |
+| High | Kratos/Hydra DSNs use `sslmode=disable` in docker-compose | Change to `sslmode=require` for production compose file |
+| High | Kratos and Hydra started with `--dev` flag | Remove `--dev` and configure explicitly for production |
+| Medium | Kratos CORS `allowed_origins: ["*"]` | Restrict to explicit origin list before production |
+| Medium | `changeme` OAuth placeholder in `kratos/kratos.yml` | Replace with `INJECTED_VIA_ENV` sentinel to fail fast on misconfiguration |
