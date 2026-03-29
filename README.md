@@ -116,7 +116,7 @@ sequenceDiagram
     GW->>Hydra: client_credentials → access_token + refresh_token
     GW->>Redis: SET session:{hex64} {kratosID, tokens, deviceID, TTL=168h}
     GW->>PG: SaveDeviceSession(kratosID, deviceID, userAgent, IP)
-    GW-->>Browser: 200 OK · Set-Cookie: __session=<hex64>; HttpOnly; Secure; SameSite=Lax · X-CSRF-Token: <hmac>
+    GW-->>Browser: "200 OK · Set-Cookie: __session=<hex64>; HttpOnly; Secure; SameSite=Lax · X-CSRF-Token: <hmac>"
 
     Note over Browser,PG: Phase 2 — Protected BFF Call  POST /bff/logout
     Browser->>GW: POST /bff/logout · Cookie: __session=… · X-CSRF-Token: …
@@ -126,7 +126,7 @@ sequenceDiagram
     GW->>Hydra: revokeToken(accessToken)
     GW->>Redis: blacklist.Revoke(jti) · DEL session:{id}
     GW->>PG: RevokeDevice(kratosID, deviceID)
-    GW-->>Browser: 204 No Content · Set-Cookie: __session=; Max-Age=0
+    GW-->>Browser: "204 No Content · Set-Cookie: __session=; Max-Age=0"
 
     Note over Browser,PG: Phase 3 — Proxied API Call  GET /api/dashboard
     Browser->>GW: GET /api/dashboard · Authorization: Bearer <access_token>
