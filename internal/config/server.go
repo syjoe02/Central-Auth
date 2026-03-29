@@ -3,14 +3,30 @@ package config
 import (
 	"log"
 	"os"
+	"strings"
 )
 
 // ServerConfig holds server-level secrets validated at startup.
 type ServerConfig struct {
-	ServiceAPIKey           string
-	AppEnv                  string
-	MetricsBasicAuthUser    string
+	ServiceAPIKey            string
+	AppEnv                   string
+	MetricsBasicAuthUser     string
 	MetricsBasicAuthPassword string
+	// TrustedProxyCIDRs is passed to gin.SetTrustedProxies to prevent
+	// X-Forwarded-For spoofing. Defaults to the Docker bridge subnet.
+	TrustedProxyCIDRs []string
+}
+
+// splitAndTrim splits a comma-separated string and trims whitespace from each element.
+func splitAndTrim(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // LoadServerConfig validates the service pre-shared key and environment mode.
@@ -58,10 +74,18 @@ func LoadServerConfig() ServerConfig {
 		}
 	}
 
+	// TRUSTED_PROXY_CIDRS is a comma-separated list of CIDR ranges for upstream
+	// proxies. If unset, the Docker default bridge subnet is used.
+	trustedCIDRs := []string{"172.16.0.0/12"} // Docker bridge default
+	if v := os.Getenv("TRUSTED_PROXY_CIDRS"); v != "" {
+		trustedCIDRs = splitAndTrim(v)
+	}
+
 	return ServerConfig{
 		ServiceAPIKey:            key,
 		AppEnv:                   appEnv,
 		MetricsBasicAuthUser:     metricsUser,
 		MetricsBasicAuthPassword: metricsPass,
+		TrustedProxyCIDRs:        trustedCIDRs,
 	}
 }

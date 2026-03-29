@@ -1,6 +1,6 @@
 version: v0.13.0
 
-dsn: memory  # overridden at runtime via DSN env var
+dsn: memory # overridden at runtime via DSN env var
 
 serve:
   public:
@@ -105,9 +105,9 @@ log:
 
 secrets:
   cookie:
-    - changeme-cookie-secret  # overridden via SECRETS_COOKIE env var
+    - ${KRATOS_COOKIE_SECRET} # overridden via SECRETS_COOKIE env var
   cipher:
-    - changeme-cipher-secret  # overridden via SECRETS_CIPHER env var
+    - ${KRATOS_CIPHER_SECRET} # overridden via SECRETS_CIPHER env var
 
 ciphers:
   algorithm: xchacha20-poly1305

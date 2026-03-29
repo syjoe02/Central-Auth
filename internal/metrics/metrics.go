@@ -1,6 +1,9 @@
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 var (
 	HTTPRequests = prometheus.NewCounterVec(
@@ -105,6 +108,35 @@ var (
 		Help: "Total access-log events dropped due to full Kafka producer channel.",
 	})
 )
+
+func RegisterPGXStats(dbName string, pool *pgxpool.Pool) {
+	prometheus.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name:        "go_pgx_pool_connections_open",
+			Help:        "The number of established connections both in use and idle.",
+			ConstLabels: prometheus.Labels{"db_name": dbName},
+		},
+		func() float64 { return float64(pool.Stat().TotalConns()) },
+	))
+
+	prometheus.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name:        "go_pgx_pool_connections_in_use",
+			Help:        "The number of connections currently in use.",
+			ConstLabels: prometheus.Labels{"db_name": dbName},
+		},
+		func() float64 { return float64(pool.Stat().AcquiredConns()) },
+	))
+
+	prometheus.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name:        "go_pgx_pool_connections_idle",
+			Help:        "The number of idle connections.",
+			ConstLabels: prometheus.Labels{"db_name": dbName},
+		},
+		func() float64 { return float64(pool.Stat().IdleConns()) },
+	))
+}
 
 func init() {
 	prometheus.MustRegister(

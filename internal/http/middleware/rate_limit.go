@@ -2,15 +2,27 @@ package middleware
 
 import (
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
+// rateLimitRequests is read once at startup from RATE_LIMIT_REQUESTS_PER_MIN.
+// Set to 0 to disable rate limiting entirely (e.g. for load testing).
+var rateLimitRequests = func() int {
+	if v := os.Getenv("RATE_LIMIT_REQUESTS_PER_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 20
+}()
+
 const (
-	rateLimitRequests = 20
-	rateLimitWindow   = time.Minute
+	rateLimitWindow = time.Minute
 	// bucketEvictInterval controls how often stale IP buckets are swept.
 	// Stale = no request in the last 2× window. At 20 req/min this keeps
 	// memory bounded even under port-scan traffic.
@@ -58,6 +70,10 @@ func (rl *rateLimiter) evictLoop() {
 }
 
 func (rl *rateLimiter) allow(ip string) bool {
+	if rateLimitRequests == 0 {
+		return true // disabled — bypass for load testing
+	}
+
 	now := time.Now()
 	v, _ := rl.buckets.LoadOrStore(ip, &bucket{windowStart: now})
 	b := v.(*bucket)

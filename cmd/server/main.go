@@ -14,12 +14,12 @@ import (
 
 	"central-auth/internal/blacklist"
 	"central-auth/internal/config"
-	hydraclient "central-auth/internal/hydra"
 	"central-auth/internal/http/handler"
-	kratosclient "central-auth/internal/kratos"
 	"central-auth/internal/http/middleware"
+	hydraclient "central-auth/internal/hydra"
 	"central-auth/internal/kafka"
-	_ "central-auth/internal/metrics"
+	kratosclient "central-auth/internal/kratos"
+	"central-auth/internal/metrics"
 	"central-auth/internal/repository"
 	"central-auth/internal/service"
 	"central-auth/internal/session"
@@ -58,7 +58,8 @@ func main() {
 		panic(fmt.Sprintf("Postgres connect failed: %v", err))
 	}
 	defer pgPool.Close()
-	fmt.Println("Postgres connected")
+	metrics.RegisterPGXStats("central_auth", pgPool)
+	fmt.Println("Postgres and PGX metrics connected")
 
 	// ── Repositories ─────────────────────────────────────────────────────────
 	redisRepo := repository.NewInstrumentedRedisRepo(
@@ -98,6 +99,16 @@ func main() {
 	bl := blacklist.NewRedisBlacklist(rdb)
 	bffService := service.NewBFFService(hydraClient, sessionStore, bl, redisRepo, deviceSessionRepo, bffConfig)
 
+	// ── Proxy config (Django API gateway) ────────────────────────────────────
+	proxyConfig, err := config.LoadProxyConfig()
+	if err != nil {
+		log.Fatalf("[FATAL] proxy config: %v", err)
+	}
+	proxyHandler, err := handler.NewProxyHandler(proxyConfig.DjangoURL, proxyConfig.DialTimeout, hydraClient)
+	if err != nil {
+		log.Fatalf("[FATAL] proxy handler init: %v", err)
+	}
+
 	// ── Handlers ──────────────────────────────────────────────────────────────
 	authHandler := handler.NewAuthHandler(authService)
 	bffHandler := handler.NewBFFHandler(bffService, bffConfig)
@@ -108,6 +119,12 @@ func main() {
 
 	// ── Router ───────────────────────────────────────────────────────────────
 	r := gin.New()
+	// Restrict trusted-proxy CIDR so c.ClientIP() cannot be spoofed via a
+	// forged X-Forwarded-For header from untrusted callers. Adjust the CIDR
+	// to match the actual upstream proxy / Docker network subnet.
+	if err := r.SetTrustedProxies(serverConfig.TrustedProxyCIDRs); err != nil {
+		log.Fatalf("[FATAL] invalid trusted proxy config: %v", err)
+	}
 	r.Use(gin.LoggerWithWriter(os.Stdout))
 	r.Use(gin.RecoveryWithWriter(os.Stderr))
 
@@ -146,6 +163,16 @@ func main() {
 			protected.GET("/whoami", bffHandler.WhoAmI)
 		}
 	}
+
+	// ── Django API proxy (/api/* → Django, JWT validated at the edge) ────────
+	// Auth-free paths (/api/auth/*) are forwarded without token validation so
+	// Django can handle login/signup/refresh/logout natively.
+	// All other /api/* paths require a valid Hydra access token (read from the
+	// Authorization: Bearer header or the access_token httpOnly cookie).
+	api := r.Group("/api")
+	api.Use(middleware.CORSMiddleware(corsOrigins))
+	api.Use(middleware.RateLimitMiddleware())
+	api.Any("/*path", proxyHandler.Handle)
 
 	// ── Admin routes (X-Service-Key protected) ────────────────────────────────
 	admin := r.Group("/admin")

@@ -48,7 +48,9 @@
           }
         }
       },
-      "required": ["email"],
+      "required": [
+        "email"
+      ],
       "additionalProperties": false
     }
   }

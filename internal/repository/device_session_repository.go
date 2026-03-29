@@ -2,11 +2,14 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"central-auth/internal/domain"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const dbQueryTimeout = 3 * time.Second
 
 // DeviceSessionRepository defines the application-level device session operations.
 // It reads and writes the device_sessions table only — never the Kratos or Hydra databases.
@@ -32,6 +35,8 @@ func NewPostgresDeviceSessionRepository(pool *pgxpool.Pool) *PostgresDeviceSessi
 // SaveDeviceSession upserts a device session row.
 // On conflict (kratos_id, device_id), it resets revoked=false and updates timestamps.
 func (r *PostgresDeviceSessionRepository) SaveDeviceSession(ctx context.Context, s *domain.DeviceSession) error {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO device_sessions
 			(kratos_id, device_id, hydra_jti, issued_at, last_used_at, revoked, user_agent, ip_address)
@@ -54,6 +59,8 @@ func (r *PostgresDeviceSessionRepository) SaveDeviceSession(ctx context.Context,
 
 // UpdateLastUsedAt sets last_used_at to NOW() for the given device.
 func (r *PostgresDeviceSessionRepository) UpdateLastUsedAt(ctx context.Context, kratosID, deviceID string) error {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	_, err := r.pool.Exec(ctx, `
 		UPDATE device_sessions
 		SET    last_used_at = NOW()
@@ -64,6 +71,8 @@ func (r *PostgresDeviceSessionRepository) UpdateLastUsedAt(ctx context.Context, 
 
 // RevokeDevice marks a single device session as revoked.
 func (r *PostgresDeviceSessionRepository) RevokeDevice(ctx context.Context, kratosID, deviceID string) error {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	_, err := r.pool.Exec(ctx, `
 		UPDATE device_sessions
 		SET    revoked = true
@@ -74,6 +83,8 @@ func (r *PostgresDeviceSessionRepository) RevokeDevice(ctx context.Context, krat
 
 // RevokeAllDevices marks all device sessions for the given Kratos identity as revoked.
 func (r *PostgresDeviceSessionRepository) RevokeAllDevices(ctx context.Context, kratosID string) error {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	_, err := r.pool.Exec(ctx, `
 		UPDATE device_sessions
 		SET    revoked = true
@@ -85,6 +96,8 @@ func (r *PostgresDeviceSessionRepository) RevokeAllDevices(ctx context.Context, 
 // GetDeviceSessions returns all device sessions for the given Kratos identity,
 // ordered by issued_at descending (most recent first).
 func (r *PostgresDeviceSessionRepository) GetDeviceSessions(ctx context.Context, kratosID string) ([]domain.DeviceSession, error) {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, kratos_id, device_id, hydra_jti,
 		       issued_at, last_used_at, revoked, user_agent, ip_address
@@ -113,6 +126,8 @@ func (r *PostgresDeviceSessionRepository) GetDeviceSessions(ctx context.Context,
 
 // CountActiveDevices returns the number of non-revoked device sessions for the identity.
 func (r *PostgresDeviceSessionRepository) CountActiveDevices(ctx context.Context, kratosID string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
 	var count int
 	err := r.pool.QueryRow(ctx, `
 		SELECT count(*)
