@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Django application metrics (django-prometheus)
+  - job_name: django
+    static_configs:
+      - targets:
+          - django:8000 # adjust to your Django server port
+
+  # Go central-auth service metrics (scraped via shared-monitor-net)
+  - job_name: central-auth
+    static_configs:
+      - targets:
+          - auth-server:9091
+    metrics_path: /metrics

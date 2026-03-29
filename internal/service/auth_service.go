@@ -3,112 +3,121 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
 	"central-auth/internal/domain"
+	"central-auth/internal/hydra"
+	"central-auth/internal/kratos"
 	"central-auth/internal/repository"
-	"central-auth/internal/token"
-
-	"github.com/google/uuid"
 )
 
 const (
-	AccessTokenTTL  = time.Minute * 15
-	RefreshTTLShort = time.Hour * 24 * 7
-	RefreshTTLLong  = time.Hour * 24 * 30
+	RefreshTTLShort = time.Hour * 24 * 7  // 7 days (default)
+	RefreshTTLLong  = time.Hour * 24 * 30 // 30 days (remember_me)
 )
 
-type AuthService struct {
-	redisRepo    *repository.RedisRepository
-	authUserRepo repository.AuthUserRepository
+// ErrInvalidToken is returned by the service for token errors that should map
+// to HTTP 401 on the caller side (bad token, expired, wrong type).
+var ErrInvalidToken = errors.New("invalid or expired token")
+
+// ErrEmailConflict is returned by Signup when the email is already registered.
+var ErrEmailConflict = errors.New("email already registered")
+
+// ErrInvalidCredentials is returned by LoginWithPassword when the credentials are wrong.
+var ErrInvalidCredentials = errors.New("invalid credentials")
+
+// VerifyResult holds the validated claims extracted from a Hydra access token.
+type VerifyResult struct {
+	KratosID  string
+	DeviceID  string
+	ExpiresAt int64
 }
 
-func NewAuthService(
-	redisRepo *repository.RedisRepository,
-	authUserRepo repository.AuthUserRepository,
-) *AuthService {
-	return &AuthService{redisRepo: redisRepo, authUserRepo: authUserRepo}
+// AuthServiceI is the interface that wraps all auth business logic operations.
+// It is satisfied by both OryAuthService (real) and InstrumentedAuthService (metrics wrapper).
+type AuthServiceI interface {
+	// Login issues Hydra tokens for a pre-authenticated Kratos identity.
+	// The caller (e.g. Django) has already verified the user's credentials.
+	Login(ctx context.Context, kratosID, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
+
+	// LoginWithPassword authenticates the user against Kratos, then issues Hydra tokens.
+	// This is the primary path used by the Django integration.
+	LoginWithPassword(ctx context.Context, email, password, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
+
+	// Logout revokes the session identified by the given Hydra refresh token.
+	Logout(ctx context.Context, refreshToken string) error
+
+	// LogoutAll revokes all sessions for the user identified by the given Hydra refresh token.
+	LogoutAll(ctx context.Context, refreshToken string) error
+
+	// Refresh exchanges a Hydra refresh token for a new access+refresh token pair.
+	Refresh(ctx context.Context, refreshToken string) (accessToken, newRefreshToken string, err error)
+
+	// VerifyToken validates a Hydra access token JWT and returns its claims.
+	// Fail-closed: any error (invalid signature, expired, JWKS unavailable) returns a non-nil error.
+	VerifyToken(ctx context.Context, accessToken string) (*VerifyResult, error)
+
+	// Signup creates a new Kratos identity with the given email and password.
+	// Returns the new Kratos identity UUID. Returns ErrEmailConflict if the
+	// email is already registered.
+	Signup(ctx context.Context, email, password string) (kratosID string, err error)
 }
 
-// accessToken : 15min, refreshToken : 7 days, rememberMe : 30 days
-func (s *AuthService) Login(userID string, deviceID string, rememberMe bool, userAgent *string, ip *string) (string, string, error) {
-	log.Printf("[AUTH] Login start user=%s device=%s", userID, deviceID)
-
-	accessToken, err := token.Generate(userID, deviceID, token.TypeAccess, AccessTokenTTL)
-	if err != nil {
-		return "", "", err
-	}
-
-	refreshTTL := RefreshTTLShort
-	if rememberMe {
-		refreshTTL = RefreshTTLLong
-	}
-
-	refreshToken, err := token.Generate(userID, deviceID, token.TypeRefresh, refreshTTL)
-	if err != nil {
-		log.Printf("[ERROR] Generate refresh token failed: %+v", err)
-		return "", "", err
-	}
-
-	if err := s.redisRepo.SaveLogin(userID, deviceID, refreshToken, refreshTTL); err != nil {
-		log.Printf("[ERROR] Redis SaveLogin failed: %+v", err)
-		return "", "", err
-	}
-
-	now := time.Now()
-	err = s.authUserRepo.SaveRefreshToken(context.Background(), &domain.RefreshToken{
-		UserID:     userID,
-		DeviceID:   deviceID,
-		TokenHash:  token.Hash(refreshToken),
-		IssuedAt:   now,
-		ExpiresAt:  now.Add(refreshTTL),
-		LastUsedAt: nil,
-		UserAgent:  userAgent,
-		IP:         ip,
-		Revoked:    false,
-	})
-	if err != nil {
-		log.Printf("[ERROR] Postgres SaveRefreshToken failed: %+v", err)
-		return "", "", err
-	}
-
-	log.Printf("[AUTH] Login success user=%s device=%s", userID, deviceID)
-	return accessToken, refreshToken, nil
+// OryAuthService implements AuthServiceI using Ory Hydra for token management
+// and Redis for atomic device-session enforcement.
+type OryAuthService struct {
+	hydra             hydra.ClientI
+	redisRepo         repository.RedisRepo
+	deviceSessionRepo repository.DeviceSessionRepository
+	kratosClient      kratos.ClientI
 }
 
-// OAuthLogin verifies the provider token, upserts the user, and issues tokens.
-func (s *AuthService) OAuthLogin(
-	provider string,
-	providerID string,
-	email string,
-	deviceID string,
+// OryAuthServiceOption is a functional option for OryAuthService.
+type OryAuthServiceOption func(*OryAuthService)
+
+// WithKratosClient sets the Kratos admin client used by the Signup method.
+func WithKratosClient(c kratos.ClientI) OryAuthServiceOption {
+	return func(s *OryAuthService) { s.kratosClient = c }
+}
+
+// NewOryAuthService creates a new OryAuthService.
+func NewOryAuthService(
+	hydraClient hydra.ClientI,
+	redisRepo repository.RedisRepo,
+	deviceSessionRepo repository.DeviceSessionRepository,
+	opts ...OryAuthServiceOption,
+) *OryAuthService {
+	s := &OryAuthService{
+		hydra:             hydraClient,
+		redisRepo:         redisRepo,
+		deviceSessionRepo: deviceSessionRepo,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// Login issues Hydra tokens for a Kratos identity.
+//
+// Flow:
+//  1. Programmatic Hydra authorization code flow → access + refresh tokens
+//  2. Redis atomic Lua script enforces max-5-device limit (evicts oldest if needed)
+//  3. device_sessions audit row is upserted in Postgres
+func (s *OryAuthService) Login(
+	ctx context.Context,
+	kratosID, deviceID string,
 	rememberMe bool,
-	userAgent *string,
-	ip *string,
+	userAgent, ip *string,
 ) (string, string, error) {
+	log.Printf("[AUTH] Login start kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
 
-	log.Printf("[AUTH] OAuthLogin start provider=%s providerID=%s device=%s",
-		provider, providerID, deviceID)
-
-	user, err := s.authUserRepo.FindByProvider(provider, providerID)
+	tokens, err := s.hydra.IssueTokens(ctx, kratosID, deviceID, rememberMe)
 	if err != nil {
-		log.Printf("[ERROR] FindByProvider failed: %+v", err)
-		return "", "", err
-	}
-
-	if user == nil {
-		log.Printf("[AUTH] Creating new AuthUser for provider=%s id=%s", provider, providerID)
-		user = &domain.AuthUser{
-			UserID:     uuid.NewString(),
-			Provider:   provider,
-			ProviderID: providerID,
-			Email:      email,
-		}
-		if err := s.authUserRepo.Save(user); err != nil {
-			log.Printf("[ERROR] Save AuthUser failed: %+v", err)
-			return "", "", err
-		}
+		log.Printf("[ERROR] Hydra IssueTokens failed: %+v", err)
+		return "", "", fmt.Errorf("login: issue tokens: %w", err)
 	}
 
 	refreshTTL := RefreshTTLShort
@@ -116,170 +125,221 @@ func (s *AuthService) OAuthLogin(
 		refreshTTL = RefreshTTLLong
 	}
 
-	accessToken, err := token.Generate(user.UserID, deviceID, token.TypeAccess, AccessTokenTTL)
-	if err != nil {
-		log.Printf("[ERROR] Generate access token failed: %+v", err)
-		return "", "", err
-	}
-
-	refreshToken, err := token.Generate(user.UserID, deviceID, token.TypeRefresh, refreshTTL)
-	if err != nil {
-		log.Printf("[ERROR] Generate refresh token failed: %+v", err)
-		return "", "", err
-	}
-
-	if err := s.redisRepo.SaveLogin(user.UserID, deviceID, refreshToken, refreshTTL); err != nil {
+	if err := s.redisRepo.SaveLogin(ctx, kratosID, deviceID, tokens.RefreshToken, refreshTTL); err != nil {
 		log.Printf("[ERROR] Redis SaveLogin failed: %+v", err)
-		return "", "", err
+		return "", "", fmt.Errorf("login: save session: %w", err)
 	}
 
 	now := time.Now()
-	err = s.authUserRepo.SaveRefreshToken(context.Background(), &domain.RefreshToken{
-		UserID:     user.UserID,
-		DeviceID:   deviceID,
-		TokenHash:  token.Hash(refreshToken),
-		IssuedAt:   now,
-		ExpiresAt:  now.Add(refreshTTL),
-		LastUsedAt: nil,
-		UserAgent:  userAgent,
-		IP:         ip,
-		Revoked:    false,
-	})
-	if err != nil {
-		log.Printf("[ERROR] Postgres SaveRefreshToken failed: %+v", err)
-		return "", "", err
+	if err := s.deviceSessionRepo.SaveDeviceSession(ctx, &domain.DeviceSession{
+		KratosID:  kratosID,
+		DeviceID:  deviceID,
+		IssuedAt:  now,
+		UserAgent: userAgent,
+		IP:        ip,
+		Revoked:   false,
+	}); err != nil {
+		log.Printf("[ERROR] Postgres SaveDeviceSession failed: %+v", err)
+		return "", "", fmt.Errorf("login: save device session: %w", err)
 	}
 
-	log.Printf("[AUTH] OAuthLogin success user=%s device=%s", user.UserID, deviceID)
-	return accessToken, refreshToken, nil
+	log.Printf("[AUTH] Login success kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
+	return tokens.AccessToken, tokens.RefreshToken, nil
 }
 
-// Logout revokes the session for the device identified by the refresh token.
-// Uses ParseIgnoreExpiry so logout succeeds even when the access token is expired —
-// Django's JWTAuthentication blocks the request before it reaches Go in that case,
-// but this ensures Go is correct if Django's skip_paths is ever updated.
-func (s *AuthService) Logout(refreshToken string) error {
+// Logout revokes the session for the device identified by the Hydra refresh token.
+//
+// Flow:
+//  1. Introspect the refresh token via Hydra Admin API → extract kratosID + deviceID
+//  2. Revoke the token in Hydra (invalidates associated access tokens too)
+//  3. Remove the device from Redis
+//  4. Mark the device_sessions row as revoked in Postgres
+func (s *OryAuthService) Logout(ctx context.Context, refreshToken string) error {
 	log.Printf("[AUTH] Logout start")
 
-	claims, err := token.ParseIgnoreExpiry(refreshToken, token.TypeRefresh)
+	introspect, err := s.hydra.IntrospectToken(ctx, refreshToken)
 	if err != nil {
-		log.Printf("[ERROR] Token parse failed: %+v", err)
-		return err
+		log.Printf("[ERROR] Hydra IntrospectToken failed: %+v", err)
+		return fmt.Errorf("%w: %w", ErrInvalidToken, err)
+	}
+	if !introspect.Active {
+		return fmt.Errorf("%w: token is inactive", ErrInvalidToken)
 	}
 
-	if claims.UserID == "" || claims.DeviceID == "" {
-		log.Printf("[ERROR] Missing claims userID=%s deviceID=%s", claims.UserID, claims.DeviceID)
-		return errors.New("missing claims")
+	kratosID := introspect.Subject
+	deviceID := introspect.DeviceID()
+	if kratosID == "" || deviceID == "" {
+		log.Printf("[ERROR] Logout: missing claims kratosID=%s deviceID=%s", maskID(kratosID), maskID(deviceID))
+		return fmt.Errorf("%w: missing subject or device_id in token", ErrInvalidToken)
 	}
 
-	if err := s.redisRepo.LogoutDevice(claims.UserID, claims.DeviceID); err != nil {
-		log.Printf("[ERROR] Redis LogoutDevice failed: %+v", err)
-		return err
+	if err := s.hydra.RevokeToken(ctx, refreshToken); err != nil {
+		log.Printf("[ERROR] Hydra RevokeToken failed: %+v", err)
+		return fmt.Errorf("logout: revoke token: %w", err)
 	}
 
-	if err := s.authUserRepo.RevokeDevice(context.Background(), claims.UserID, claims.DeviceID); err != nil {
-		log.Printf("[ERROR] Postgres RevokeDevice failed: %+v", err)
-		return err
+	if err := s.redisRepo.LogoutDevice(ctx, kratosID, deviceID); err != nil {
+		log.Printf("[WARN] logout: Redis cleanup failed (non-fatal): %v", err)
 	}
 
-	log.Printf("[AUTH] Logout success user=%s device=%s", claims.UserID, claims.DeviceID)
+	if err := s.deviceSessionRepo.RevokeDevice(ctx, kratosID, deviceID); err != nil {
+		log.Printf("[WARN] logout: Postgres revoke failed (non-fatal): %v", err)
+	}
+
+	log.Printf("[AUTH] Logout success kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
 	return nil
 }
 
-// LogoutAll revokes all sessions for the user identified by the refresh token.
-func (s *AuthService) LogoutAll(refreshToken string) error {
+// LogoutAll revokes all sessions for the user identified by the Hydra refresh token.
+//
+// Flow:
+//  1. Introspect the refresh token → extract kratosID
+//  2. Hydra Admin API: delete all tokens for the subject
+//  3. Redis: remove all device entries
+//  4. Postgres: mark all device_sessions rows as revoked
+func (s *OryAuthService) LogoutAll(ctx context.Context, refreshToken string) error {
 	log.Printf("[AUTH] LogoutAll start")
 
-	claims, err := token.ParseTyped(refreshToken, token.TypeRefresh)
+	introspect, err := s.hydra.IntrospectToken(ctx, refreshToken)
 	if err != nil {
-		log.Printf("[ERROR] Token parse failed: %+v", err)
-		return err
+		log.Printf("[ERROR] Hydra IntrospectToken failed: %+v", err)
+		return fmt.Errorf("%w: %w", ErrInvalidToken, err)
+	}
+	if !introspect.Active {
+		return fmt.Errorf("%w: token is inactive", ErrInvalidToken)
 	}
 
-	if claims.UserID == "" {
-		log.Printf("[ERROR] Missing user_id in claims")
-		return errors.New("missing user_id")
+	kratosID := introspect.Subject
+	if kratosID == "" {
+		return fmt.Errorf("%w: missing subject in token", ErrInvalidToken)
 	}
 
-	if err := s.redisRepo.LogoutAll(claims.UserID); err != nil {
-		log.Printf("[ERROR] Redis LogoutAll failed: %+v", err)
-		return err
+	if err := s.hydra.RevokeAllForSubject(ctx, kratosID); err != nil {
+		log.Printf("[ERROR] Hydra RevokeAllForSubject failed: %+v", err)
+		return fmt.Errorf("logout all: revoke tokens: %w", err)
 	}
 
-	if err := s.authUserRepo.RevokeAllDevices(context.Background(), claims.UserID); err != nil {
-		log.Printf("[ERROR] Postgres RevokeAllDevices failed: %+v", err)
-		return err
+	if err := s.redisRepo.LogoutAll(ctx, kratosID); err != nil {
+		log.Printf("[WARN] logout all: Redis cleanup failed (non-fatal): %v", err)
 	}
 
-	log.Printf("[AUTH] LogoutAll success user=%s", claims.UserID)
+	if err := s.deviceSessionRepo.RevokeAllDevices(ctx, kratosID); err != nil {
+		log.Printf("[WARN] logout all: Postgres revoke failed (non-fatal): %v", err)
+	}
+
+	log.Printf("[AUTH] LogoutAll success kratosID=%s", maskID(kratosID))
 	return nil
 }
 
-// Refresh validates the refresh token, rotates it, and returns a new access + refresh token pair.
-// The old refresh token is invalidated in Redis immediately — any replay of the old token is rejected.
-func (s *AuthService) Refresh(refreshToken string) (string, string, error) {
+// Refresh exchanges a Hydra refresh token for a new access+refresh token pair.
+//
+// Flow:
+//  1. Call Hydra token endpoint with grant_type=refresh_token
+//  2. Parse the new access token JWT to extract kratosID and deviceID
+//  3. Update Redis with the new refresh token (old token is now invalid in Hydra)
+//  4. Update device_sessions.last_used_at
+func (s *OryAuthService) Refresh(ctx context.Context, refreshToken string) (string, string, error) {
 	log.Printf("[AUTH] Refresh start")
 
-	claims, err := token.ParseTyped(refreshToken, token.TypeRefresh)
+	tokens, err := s.hydra.RefreshToken(ctx, refreshToken)
 	if err != nil {
-		log.Printf("[ERROR] Token parse failed: %+v", err)
-		return "", "", err
+		log.Printf("[ERROR] Hydra RefreshToken failed: %+v", err)
+		return "", "", fmt.Errorf("%w: %w", ErrInvalidToken, err)
 	}
 
-	userID := claims.UserID
-	deviceID := claims.DeviceID
-
-	// Validate token value against Redis — rejects previous-generation tokens after rotation
-	valid, err := s.redisRepo.ValidateRefreshToken(userID, deviceID, refreshToken)
+	// Parse the new access token to get kratosID and deviceID for cleanup.
+	claims, err := s.hydra.ValidateAccessToken(ctx, tokens.AccessToken)
 	if err != nil {
-		log.Printf("[ERROR] Redis ValidateRefreshToken failed: %+v", err)
-		return "", "", err
-	}
-	if !valid {
-		log.Printf("[WARN] Refresh token invalid or rotated user=%s device=%s", userID, deviceID)
-		return "", "", errors.New("refresh token expired or revoked")
+		log.Printf("[ERROR] Parse new access token failed: %+v", err)
+		return "", "", fmt.Errorf("refresh: parse new access token: %w", err)
 	}
 
-	// Determine TTL from remaining lifetime of the current token
-	refreshTTL := time.Until(claims.ExpiresAt.Time)
-	if refreshTTL <= 0 {
-		return "", "", errors.New("refresh token expired")
+	kratosID := claims.Subject
+	deviceID := claims.DeviceID()
+
+	if err := s.redisRepo.RotateRefreshToken(ctx, kratosID, deviceID, tokens.RefreshToken, RefreshTTLLong); err != nil {
+		log.Printf("[WARN] refresh: Redis rotate failed (non-fatal): %v", err)
 	}
 
-	newAccessToken, err := token.Generate(userID, deviceID, token.TypeAccess, AccessTokenTTL)
-	if err != nil {
-		log.Printf("[ERROR] Generate new access token failed: %+v", err)
-		return "", "", err
+	if err := s.deviceSessionRepo.UpdateLastUsedAt(ctx, kratosID, deviceID); err != nil {
+		log.Printf("[WARN] refresh: Postgres update last_used_at failed (non-fatal): %v", err)
 	}
 
-	newRefreshToken, err := token.Generate(userID, deviceID, token.TypeRefresh, refreshTTL)
-	if err != nil {
-		log.Printf("[ERROR] Generate new refresh token failed: %+v", err)
-		return "", "", err
-	}
-
-	// Overwrite Redis with the new token — old token string is now invalid
-	if err := s.redisRepo.RotateRefreshToken(userID, deviceID, newRefreshToken, refreshTTL); err != nil {
-		log.Printf("[ERROR] Redis RotateRefreshToken failed: %+v", err)
-		return "", "", err
-	}
-
-	// Update Postgres hash + last_used_at in one query
-	if err := s.authUserRepo.UpdateTokenHash(context.Background(), userID, deviceID, token.Hash(newRefreshToken)); err != nil {
-		log.Printf("[ERROR] Postgres UpdateTokenHash failed: %+v", err)
-		return "", "", err
-	}
-
-	log.Printf("[AUTH] Refresh success user=%s device=%s", userID, deviceID)
-	return newAccessToken, newRefreshToken, nil
+	log.Printf("[AUTH] Refresh success kratosID=%s device=%s", maskID(kratosID), maskID(deviceID))
+	return tokens.AccessToken, tokens.RefreshToken, nil
 }
 
-// ExistsSession checks whether a live session exists in Redis for the given user+device.
-// Used by /auth/verify — only needs existence, not token value validation.
-func (s *AuthService) ExistsSession(userID, deviceID string) (bool, error) {
-	exists, err := s.redisRepo.ExistsRefreshToken(userID, deviceID)
+// VerifyToken validates a Hydra JWT access token locally using JWKS.
+// Fail-closed: any error causes the caller to return HTTP 401.
+func (s *OryAuthService) VerifyToken(ctx context.Context, accessToken string) (*VerifyResult, error) {
+	claims, err := s.hydra.ValidateAccessToken(ctx, accessToken)
 	if err != nil {
-		log.Printf("[ERROR] ExistsSession Redis check failed: %+v", err)
+		return nil, err
 	}
-	return exists, err
+	deviceID := claims.DeviceID()
+	if claims.Subject == "" || deviceID == "" {
+		return nil, errors.New("missing subject or device_id in token")
+	}
+	var exp int64
+	if claims.ExpiresAt != nil {
+		exp = claims.ExpiresAt.Unix()
+	}
+	return &VerifyResult{
+		KratosID:  claims.Subject,
+		DeviceID:  deviceID,
+		ExpiresAt: exp,
+	}, nil
 }
+
+// maskID truncates an identifier to its first 8 characters for safe log output.
+// Full UUIDs (e.g. Kratos identities) must not appear in logs in production.
+func maskID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8] + "..."
+}
+
+// LoginWithPassword authenticates the user via Kratos self-service, then issues Hydra tokens.
+// This is the primary path for the Django integration (email+password login).
+func (s *OryAuthService) LoginWithPassword(
+	ctx context.Context,
+	email, password, deviceID string,
+	rememberMe bool,
+	userAgent, ip *string,
+) (string, string, error) {
+	if s.kratosClient == nil {
+		return "", "", fmt.Errorf("login_with_password: Kratos client not configured")
+	}
+	kratosID, err := s.kratosClient.AuthenticatePassword(ctx, email, password)
+	if err != nil {
+		if errors.Is(err, kratos.ErrInvalidCredentials) {
+			return "", "", ErrInvalidCredentials
+		}
+		log.Printf("[ERROR] Kratos AuthenticatePassword failed: %v", err)
+		return "", "", fmt.Errorf("login_with_password: authenticate: %w", err)
+	}
+	return s.Login(ctx, kratosID, deviceID, rememberMe, userAgent, ip)
+}
+
+// Signup creates a new Kratos identity with the given email and password.
+// Returns the Kratos identity UUID on success. Returns ErrEmailConflict if the
+// email is already registered.
+func (s *OryAuthService) Signup(ctx context.Context, email, password string) (string, error) {
+	if s.kratosClient == nil {
+		return "", fmt.Errorf("signup: Kratos client not configured")
+	}
+	id, err := s.kratosClient.CreateIdentity(ctx, email, password)
+	if err != nil {
+		if errors.Is(err, kratos.ErrEmailConflict) {
+			return "", ErrEmailConflict
+		}
+		log.Printf("[ERROR] Kratos CreateIdentity failed: %v", err)
+		return "", fmt.Errorf("signup: create identity: %w", err)
+	}
+	log.Printf("[AUTH] Signup success kratosID=%s", maskID(id))
+	return id, nil
+}
+
+// compile-time interface check
+var _ AuthServiceI = (*OryAuthService)(nil)

@@ -3,13 +3,16 @@ package middleware
 import (
 	"crypto/subtle"
 	"net/http"
-	"os"
 
 	"github.com/gin-gonic/gin"
 )
 
-func ServiceAuthMiddleware() gin.HandlerFunc {
-	expected := []byte(os.Getenv("SERVICE_API_KEY"))
+// ServiceAuthMiddleware validates the X-Service-Key header against the
+// provided serviceKey value. The caller (main) is responsible for reading the
+// key from config so this middleware does not access environment variables
+// directly.
+func ServiceAuthMiddleware(serviceKey string) gin.HandlerFunc {
+	expected := []byte(serviceKey)
 
 	return func(c *gin.Context) {
 		serviceKey := c.GetHeader("X-Service-Key")
