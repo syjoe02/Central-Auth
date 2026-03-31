@@ -59,6 +59,8 @@ services:
     expose:
       - "4434" # admin — internal only, never routed to host
     environment:
+      # Pool limits are set in kratos/kratos.yml (database.max_open_connections etc.)
+      # DSN query params are no-ops in gobuffalo/pop — do not add them here.
       DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/kratos?sslmode=disable
       SECRETS_COOKIE: ${KRATOS_COOKIE_SECRET}
       SECRETS_CIPHER: ${KRATOS_CIPHER_SECRET}
@@ -100,6 +102,10 @@ services:
     command: serve all --dev
     environment:
       DSN: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable
+      # Hydra connection pool — set via env vars (DSN query params are no-ops).
+      DB_MAX_OPEN_CONNS: 20
+      DB_MAX_IDLE_CONNS: 5
+      DB_CONN_MAX_LIFETIME: 3600
       SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET}
       URLS_SELF_ISSUER: http://localhost:4444/
       URLS_LOGIN: http://auth-server:8081/hydra/login

@@ -2,6 +2,13 @@ version: v0.13.0
 
 dsn: memory # overridden at runtime via DSN env var
 
+# Connection pool — gobuffalo/pop settings (DSN query params are no-ops in pgx).
+# These are the correct knobs for Kratos v1.x.
+database:
+  max_open_connections: 50
+  max_idle_connections: 10
+  max_connection_lifetime: 1h
+
 serve:
   public:
     base_url: http://kratos:4433/
