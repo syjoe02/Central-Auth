@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,8 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	authv1 "central-auth/gen/go/auth/v1"
 	"central-auth/internal/blacklist"
 	"central-auth/internal/config"
+	"central-auth/internal/database"
+	grpcinterceptor "central-auth/internal/grpc/interceptor"
+	grpcserver "central-auth/internal/grpc/server"
 	"central-auth/internal/http/handler"
 	"central-auth/internal/http/middleware"
 	hydraclient "central-auth/internal/hydra"
@@ -21,18 +26,38 @@ import (
 	kratosclient "central-auth/internal/kratos"
 	"central-auth/internal/metrics"
 	"central-auth/internal/repository"
+	"central-auth/internal/resilience"
 	"central-auth/internal/service"
 	"central-auth/internal/session"
 
+	gocache "github.com/patrickmn/go-cache"
+
+	"github.com/getsentry/sentry-go"
+	sentrygin "github.com/getsentry/sentry-go/gin"
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
 )
 
 func main() {
+	// ── Sentry (optional; disabled when SENTRY_DSN is empty) ────────────────
+	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
+		if err := sentry.Init(sentry.ClientOptions{
+			Dsn:              dsn,
+			Environment:      os.Getenv("APP_ENV"),
+			TracesSampleRate: 0.1,
+		}); err != nil {
+			log.Printf("[WARN] Sentry init failed: %v", err)
+		} else {
+			defer sentry.Flush(2 * time.Second)
+			log.Println("[INFO] Sentry error tracking initialised")
+		}
+	}
+
 	// ── Server config (fail-fast secret validation) ───────────────────────────
 	serverConfig := config.LoadServerConfig()
 
-	// ── Kafka access-log producer ─────────────────────────────────────────────
+	// ── Kafka access-log producer + device-session consumer ──────────────────
 	kafkaConfig := config.LoadKafkaConfig()
 	kafkaProducer, kafkaErr := kafka.NewProducer(kafkaConfig)
 	if kafkaErr != nil && kafkaConfig.IsProduction {
@@ -61,10 +86,37 @@ func main() {
 	metrics.RegisterPGXStats("central_auth", pgPool)
 	fmt.Println("Postgres and PGX metrics connected")
 
+	// ── Database migrations ───────────────────────────────────────────────────
+	if err := database.RunMigrations(config.PostgresDSN()); err != nil {
+		log.Fatalf("[FATAL] database migration failed: %v", err)
+	}
+	log.Println("[INFO] Database migrations applied")
+
+	// ── Resilience: circuit breaker + L1 cache ───────────────────────────────
+	resilienceCfg := config.LoadResilienceConfig()
+	cb := resilience.NewCircuitBreaker(resilience.ResilienceCBConfig{
+		FailureThreshold: resilienceCfg.FailureThreshold,
+		ProbeBaseNanos:   int64(resilienceCfg.ProbeBaseSeconds) * int64(time.Second),
+		ProbeMaxNanos:    int64(resilienceCfg.ProbeMaxSeconds) * int64(time.Second),
+		JitterPct:        int64(resilienceCfg.JitterPct),
+	})
+	l1Cache := gocache.New(1*time.Minute, 2*time.Minute)
+
 	// ── Repositories ─────────────────────────────────────────────────────────
-	redisRepo := repository.NewInstrumentedRedisRepo(
-		repository.NewRedisRepository(rdb),
-	)
+	blacklistPgRepo := repository.NewPostgresBlacklistRepository(pgPool)
+
+	rawRedisRepo    := repository.NewRedisRepository(rdb)
+	rawSessionStore := session.NewRedisStore(rdb, bffConfig.SessionTTL)
+	rawBlacklist    := blacklist.NewRedisBlacklist(rdb)
+
+	resilientRedisRepo    := resilience.NewResilientRedisRepo(rawRedisRepo, cb, l1Cache)
+	resilientSessionStore := resilience.NewResilientSessionStore(rawSessionStore, cb, l1Cache)
+	resilientBlacklist    := resilience.NewResilientBlacklist(rawBlacklist, cb, l1Cache, blacklistPgRepo)
+	idempotencyCache      := resilience.NewResilientIdempotencyCache(rdb, cb)
+
+	// Instrumented wrapper sits outside the resilient layer so Prometheus latency
+	// metrics reflect actual attempt counts (not CB fast-fails).
+	redisRepo := repository.NewInstrumentedRedisRepo(resilientRedisRepo)
 	deviceSessionRepo := repository.NewInstrumentedDeviceSessionRepository(
 		repository.NewPostgresDeviceSessionRepository(pgPool),
 	)
@@ -86,18 +138,36 @@ func main() {
 	// ── Kratos admin client (identity management) ─────────────────────────────
 	kratosAdminClient := kratosclient.New(oryConfig.KratosAdminURL, oryConfig.KratosPublicURL)
 
+	// ── Device-session Kafka consumer (started after repo is ready) ──────────
+	// Reads AuthSessionEvents from the access-logs topic and persists them to
+	// device_sessions. Runs in its own goroutine; stopped before the producer
+	// closes to ensure no in-flight DB writes are abandoned.
+	// Only started when a real broker is reachable; skipped for NoopPublisher so
+	// there is no reconnect log spam in non-production environments.
+	var deviceSessionConsumer *kafka.DeviceSessionConsumer
+	var consumerCancel context.CancelFunc = func() {} // no-op default
+
+	if kafka.ShouldStartConsumer(kafkaProducer) {
+		var consumerCtx context.Context
+		consumerCtx, consumerCancel = context.WithCancel(context.Background())
+		deviceSessionConsumer = kafka.NewDeviceSessionConsumer(kafkaConfig, deviceSessionRepo)
+		go deviceSessionConsumer.Run(consumerCtx)
+		log.Printf("[INFO] device-session Kafka consumer started")
+	} else {
+		log.Printf("[INFO] Kafka unavailable — device-session consumer skipped")
+	}
+
 	// ── S2S auth service (existing /auth/* endpoints) ─────────────────────────
 	authService := service.NewInstrumentedAuthService(
 		service.NewOryAuthService(
 			hydraClient, redisRepo, deviceSessionRepo,
 			service.WithKratosClient(kratosAdminClient),
+			service.WithEventPublisher(kafkaProducer),
 		),
 	)
 
 	// ── BFF session layer ─────────────────────────────────────────────────────
-	sessionStore := session.NewRedisStore(rdb, bffConfig.SessionTTL)
-	bl := blacklist.NewRedisBlacklist(rdb)
-	bffService := service.NewBFFService(hydraClient, sessionStore, bl, redisRepo, deviceSessionRepo, bffConfig)
+	bffService := service.NewBFFService(hydraClient, resilientSessionStore, resilientBlacklist, redisRepo, deviceSessionRepo, bffConfig, kafkaProducer)
 
 	// ── Proxy config (Django API gateway) ────────────────────────────────────
 	proxyConfig, err := config.LoadProxyConfig()
@@ -127,6 +197,7 @@ func main() {
 	}
 	r.Use(gin.LoggerWithWriter(os.Stdout))
 	r.Use(gin.RecoveryWithWriter(os.Stderr))
+	r.Use(sentrygin.New(sentrygin.Options{Repanic: true}))
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
@@ -144,6 +215,7 @@ func main() {
 		auth.POST("/logout", authHandler.Logout)
 		auth.POST("/logout-all", authHandler.LogoutAll)
 		auth.POST("/verify", authHandler.Verify)
+		auth.POST("/google/login", authHandler.GoogleLogin)
 	}
 
 	// ── BFF routes (browser cookie-based) ─────────────────────────────────────
@@ -180,6 +252,35 @@ func main() {
 	{
 		admin.POST("/jwks/refresh", adminHandler.RefreshJWKS)
 	}
+
+	// ── gRPC server (8-stage interceptor chain) ──────────────────────────────
+	// Interceptor order (outermost → innermost):
+	//   Recovery → Prometheus → RequestID → Logging →
+	//   ServiceAuth → KafkaAccessLog → RateLimit → Idempotency
+	grpcSrv := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			grpcinterceptor.Recovery(),
+			grpcinterceptor.Prometheus(),
+			grpcinterceptor.RequestID(),
+			grpcinterceptor.Logging(),
+			grpcinterceptor.ServiceAuth(serverConfig.ServiceAPIKey),
+			grpcinterceptor.KafkaAccessLog(kafkaProducer),
+			grpcinterceptor.RateLimit(serverConfig.RateLimitRequestsPerMin),
+			grpcinterceptor.Idempotency(idempotencyCache),
+		),
+	)
+	authv1.RegisterAuthServiceServer(grpcSrv, grpcserver.New(authService))
+
+	grpcLis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("[FATAL] gRPC listen :50051: %v", err)
+	}
+	go func() {
+		log.Println("[INFO] gRPC server listening on :50051")
+		if err := grpcSrv.Serve(grpcLis); err != nil {
+			log.Printf("[ERROR] gRPC server exited: %v", err)
+		}
+	}()
 
 	// ── Metrics server (internal only, not published to host) ─────────────────
 	// MetricsAllowlistHandler checks RemoteAddr (direct TCP peer). There is no
@@ -239,14 +340,14 @@ func main() {
 		// races with shutdown. (M-3)
 		close(sighupStop)
 
-		// ── Phase 1: drain HTTP servers (10 s shared budget) ──────────────────
-		// H-3: HTTP servers must be fully stopped before Kafka is closed.
+		// ── Phase 1: drain HTTP + gRPC servers (10 s shared budget) ─────────
+		// H-3: all servers must be fully stopped before Kafka is closed.
 		// Any in-flight handler that calls Publish must complete first;
 		// only then is it safe to close the producer channel.
 		httpCtx, httpCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer httpCancel()
 		var httpWg sync.WaitGroup
-		httpWg.Add(2)
+		httpWg.Add(3)
 		go func() {
 			defer httpWg.Done()
 			if err := mainSrv.Shutdown(httpCtx); err != nil {
@@ -259,7 +360,23 @@ func main() {
 				log.Printf("[ERROR] Metrics server shutdown: %v", err)
 			}
 		}()
+		go func() {
+			defer httpWg.Done()
+			grpcSrv.GracefulStop() // waits for in-flight RPCs to complete
+		}()
 		httpWg.Wait() // H-3: no more Publish calls possible after this point
+
+		// ── Phase 1.5: stop device-session consumer ───────────────────────────
+		// consumerCancel is always safe to call (it is either a real cancel func
+		// or the no-op default set above). The nil check guards RunDone/Close
+		// for the case where the consumer was never started.
+		consumerCancel()
+		if deviceSessionConsumer != nil {
+			<-deviceSessionConsumer.RunDone()
+			if err := deviceSessionConsumer.Close(); err != nil {
+				log.Printf("[ERROR] Device-session consumer close: %v", err)
+			}
+		}
 
 		// ── Phase 2: drain Kafka producer (own 5 s budget) ────────────────────
 		// M-4: Kafka gets a fresh context so its drain time is not charged

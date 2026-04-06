@@ -107,6 +107,45 @@ var (
 		Name: "central_auth_kafka_events_dropped_total",
 		Help: "Total access-log events dropped due to full Kafka producer channel.",
 	})
+
+	// KafkaAuthSessionsPublished counts AuthSessionEvents successfully written to Kafka.
+	KafkaAuthSessionsPublished = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_kafka_auth_sessions_published_total",
+		Help: "Total AuthSessionEvent messages successfully written to Kafka at login.",
+	})
+
+	// KafkaAuthSessionsDropped counts AuthSessionEvents dropped because the authCh
+	// channel was full. Separate from KafkaEventsDropped (access logs) because a
+	// dropped auth-session event is a lost audit record — a distinct SLO signal.
+	KafkaAuthSessionsDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_kafka_auth_sessions_dropped_total",
+		Help: "Total AuthSessionEvent messages dropped due to full auth producer channel.",
+	})
+
+	// KafkaConsumerErrors counts consumer-side processing failures by operation.
+	// label "operation": "fetch", "unmarshal", "parse_timestamp", "save_device_session"
+	KafkaConsumerErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "central_auth_kafka_consumer_errors_total",
+			Help: "Total Kafka consumer processing errors by operation.",
+		},
+		[]string{"operation"},
+	)
+
+	// KafkaConsumerSkipped counts messages on the access-logs topic that were not
+	// AuthSessionEvents (e.g. AccessLogEvents). Expected to be the majority of
+	// traffic; useful for verifying the consumer is running and filtering correctly.
+	KafkaConsumerSkipped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "central_auth_kafka_consumer_skipped_total",
+		Help: "Total non-auth-session messages skipped by the DeviceSessionConsumer.",
+	})
+
+	// KafkaConsumerLag is the current estimated consumer group lag for the
+	// device-session consumer (sampled every 10s from reader.Stats().Lag).
+	KafkaConsumerLag = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "central_auth_kafka_consumer_lag",
+		Help: "Current Kafka consumer group lag (messages behind) for the device-session consumer.",
+	})
 )
 
 func RegisterPGXStats(dbName string, pool *pgxpool.Pool) {
@@ -153,5 +192,10 @@ func init() {
 		BFFJWKSDeprecatedKidUsed,
 		BFFCSRFRejected,
 		KafkaEventsDropped,
+		KafkaAuthSessionsPublished,
+		KafkaAuthSessionsDropped,
+		KafkaConsumerErrors,
+		KafkaConsumerSkipped,
+		KafkaConsumerLag,
 	)
 }

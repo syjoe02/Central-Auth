@@ -201,6 +201,53 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 	})
 }
 
+// GoogleLogin handles POST /auth/google/login.
+// Called by Django's CentralAuthAdapter after a successful Kratos Google OIDC flow.
+// The email has already been verified by Kratos; we look up the identity and issue tokens.
+//
+// Request body: {"email","device_id","remember_me"}
+func (h *AuthHandler) GoogleLogin(c *gin.Context) {
+	var req struct {
+		Email      string `json:"email" binding:"required,email"`
+		DeviceID   string `json:"device_id" binding:"required"`
+		RememberMe bool   `json:"remember_me"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	userAgent := c.GetHeader("User-Agent")
+	ip := c.ClientIP()
+	var uaPtr, ipPtr *string
+	if userAgent != "" {
+		uaPtr = &userAgent
+	}
+	if ip != "" {
+		ipPtr = &ip
+	}
+
+	access, refresh, err := h.authService.GoogleLogin(
+		c.Request.Context(),
+		req.Email, req.DeviceID, req.RememberMe,
+		uaPtr, ipPtr,
+	)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidCredentials) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "google account not registered"})
+			return
+		}
+		log.Printf("GoogleLogin error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, model.LoginResponse{
+		AccessToken:  access,
+		RefreshToken: refresh,
+	})
+}
+
 // Verify handles POST /auth/verify.
 // Expects Authorization: Bearer <hydra-access-token>.
 // Validates the JWT locally via Hydra's JWKS — no Hydra round-trip on the hot path.

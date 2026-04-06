@@ -25,7 +25,10 @@ func NewRedisClient() *redis.Client {
 	})
 }
 
-func NewPostgresConn() (*pgxpool.Pool, error) {
+// PostgresDSN constructs the postgres:// connection string from environment
+// variables. It is exported so that callers such as the migration runner can
+// obtain the DSN without also creating a pgxpool.
+func PostgresDSN() string {
 	host := os.Getenv("POSTGRES_HOST")
 	port := os.Getenv("POSTGRES_PORT")
 	user := os.Getenv("POSTGRES_USER")
@@ -34,16 +37,19 @@ func NewPostgresConn() (*pgxpool.Pool, error) {
 	sslmode := os.Getenv("POSTGRES_SSLMODE")
 
 	if host == "" {
-		// Local fallback
 		host = "localhost"
 	}
 	if sslmode == "" {
 		sslmode = "require"
 	}
 
-	dsn := "postgres://" + user + ":" + password +
+	return "postgres://" + user + ":" + password +
 		"@" + host + ":" + port + "/" + db +
 		"?sslmode=" + sslmode
+}
+
+func NewPostgresConn() (*pgxpool.Pool, error) {
+	dsn := PostgresDSN()
 
 	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {

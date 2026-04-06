@@ -33,7 +33,17 @@ func NewPostgresDeviceSessionRepository(pool *pgxpool.Pool) *PostgresDeviceSessi
 }
 
 // SaveDeviceSession upserts a device session row.
-// On conflict (kratos_id, device_id), it resets revoked=false and updates timestamps.
+//
+// On conflict (kratos_id, device_id) the following rules apply:
+//
+//   - hydra_jti: updated only when the new value is non-NULL; a NULL incoming
+//     JTI (ValidateAccessToken failed) never overwrites a previously stored JTI.
+//   - last_used_at: preserved if the existing value is more recent (GREATEST),
+//     preventing a Kafka replay from wiping activity written by UpdateLastUsedAt.
+//   - revoked: preserved if the session was previously revoked AND the new login
+//     brings a different JTI (genuine re-login un-revokes); otherwise kept as-is.
+//     This prevents a replayed Kafka message from silently un-revoking a device.
+//   - user_agent / ip_address: always updated to reflect the current login context.
 func (r *PostgresDeviceSessionRepository) SaveDeviceSession(ctx context.Context, s *domain.DeviceSession) error {
 	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()
@@ -43,10 +53,17 @@ func (r *PostgresDeviceSessionRepository) SaveDeviceSession(ctx context.Context,
 		VALUES
 			($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (kratos_id, device_id) DO UPDATE SET
-			hydra_jti    = EXCLUDED.hydra_jti,
+			hydra_jti    = COALESCE(EXCLUDED.hydra_jti, device_sessions.hydra_jti),
 			issued_at    = EXCLUDED.issued_at,
-			last_used_at = EXCLUDED.last_used_at,
-			revoked      = false,
+			last_used_at = COALESCE(GREATEST(EXCLUDED.last_used_at, device_sessions.last_used_at),
+			                        device_sessions.last_used_at,
+			                        EXCLUDED.last_used_at),
+			revoked      = CASE
+			                   WHEN EXCLUDED.hydra_jti IS NOT NULL
+			                        AND EXCLUDED.hydra_jti IS DISTINCT FROM device_sessions.hydra_jti
+			                   THEN false
+			                   ELSE device_sessions.revoked
+			               END,
 			user_agent   = EXCLUDED.user_agent,
 			ip_address   = EXCLUDED.ip_address
 	`,

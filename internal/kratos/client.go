@@ -29,6 +29,9 @@ type Identity struct {
 // ClientI is the interface that the service layer depends on for Kratos operations.
 type ClientI interface {
 	GetIdentity(ctx context.Context, identityID string) (*Identity, error)
+	// GetIdentityByEmail looks up an identity by email credential using the Admin API.
+	// Returns ErrInvalidCredentials if no identity with that email exists.
+	GetIdentityByEmail(ctx context.Context, email string) (*Identity, error)
 	DeleteSessions(ctx context.Context, identityID string) error
 	CreateIdentity(ctx context.Context, email, password string) (id string, err error)
 	// AuthenticatePassword verifies email+password via Kratos self-service API mode
@@ -235,6 +238,36 @@ func (c *Client) AuthenticatePassword(ctx context.Context, email, password strin
 		return "", fmt.Errorf("kratos: missing identity id in login response")
 	}
 	return id, nil
+}
+
+// GetIdentityByEmail looks up a Kratos identity using the credentials_identifier
+// query parameter on the Admin list-identities endpoint. Returns ErrInvalidCredentials
+// when no identity with that email exists.
+func (c *Client) GetIdentityByEmail(ctx context.Context, email string) (*Identity, error) {
+	url := fmt.Sprintf("%s/admin/identities?credentials_identifier=%s", c.adminURL, email)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("kratos: build get-by-email request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("kratos: get-by-email request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("kratos: unexpected status %d from list identities", resp.StatusCode)
+	}
+
+	var identities []Identity
+	if err := json.NewDecoder(resp.Body).Decode(&identities); err != nil {
+		return nil, fmt.Errorf("kratos: decode list-identities response: %w", err)
+	}
+	if len(identities) == 0 {
+		return nil, ErrInvalidCredentials
+	}
+	return &identities[0], nil
 }
 
 // compile-time interface check
