@@ -38,6 +38,9 @@ func (m *mockHydraClient) IntrospectToken(ctx context.Context, token string) (*h
 	return m.introspectFunc(ctx, token)
 }
 func (m *mockHydraClient) ValidateAccessToken(ctx context.Context, token string) (*hydra.AccessTokenClaims, error) {
+	if m.validateAccessFunc == nil {
+		return nil, errors.New("validateAccessFunc not configured")
+	}
 	return m.validateAccessFunc(ctx, token)
 }
 func (m *mockHydraClient) ForceRefreshJWKS(_ context.Context) error { return nil }
@@ -474,5 +477,143 @@ func TestVerifyToken_MissingDeviceID_ReturnsFail(t *testing.T) {
 	_, err := svc.VerifyToken(context.Background(), "jwt")
 	if err == nil {
 		t.Fatal("expected error for missing device_id claim")
+	}
+}
+
+// ── Test: Login async Kafka path ─────────────────────────────────────────────
+
+func TestLogin_PublishesAuthSessionEvent_WithJTI(t *testing.T) {
+	pub := &mockEventPublisher{}
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			c := goodClaims("kratos-id-1", "device-1")
+			c.ID = "jti-from-hydra"
+			return c, nil
+		},
+	}
+	r := &mockRedisRepo{saveLoginFunc: noopSaveLogin}
+
+	svc := service.NewOryAuthService(h, r, &mockDeviceSessionRepo{}, service.WithEventPublisher(pub))
+	_, _, err := svc.Login(context.Background(), "kratos-id-1", "device-1", false, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(pub.authSessions) != 1 {
+		t.Fatalf("expected 1 AuthSessionEvent published, got %d", len(pub.authSessions))
+	}
+	ev := pub.authSessions[0]
+	if ev.EventType != "auth.session.created" {
+		t.Errorf("EventType: want auth.session.created, got %s", ev.EventType)
+	}
+	if ev.KratosID != "kratos-id-1" {
+		t.Errorf("KratosID: want kratos-id-1, got %s", ev.KratosID)
+	}
+	if ev.HydraJTI != "jti-from-hydra" {
+		t.Errorf("HydraJTI: want jti-from-hydra, got %s", ev.HydraJTI)
+	}
+}
+
+func TestLogin_ValidateTokenFailure_StillSucceeds_EmptyJTI(t *testing.T) {
+	pub := &mockEventPublisher{}
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+		validateAccessFunc: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return nil, errors.New("jwks unavailable")
+		},
+	}
+	r := &mockRedisRepo{saveLoginFunc: noopSaveLogin}
+
+	svc := service.NewOryAuthService(h, r, &mockDeviceSessionRepo{}, service.WithEventPublisher(pub))
+	access, refresh, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil)
+	if err != nil {
+		t.Fatalf("login must succeed even when ValidateAccessToken fails, got: %v", err)
+	}
+	if access == "" || refresh == "" {
+		t.Fatal("expected non-empty tokens")
+	}
+	if len(pub.authSessions) != 1 {
+		t.Fatalf("expected 1 event even with empty JTI, got %d", len(pub.authSessions))
+	}
+	if pub.authSessions[0].HydraJTI != "" {
+		t.Errorf("expected empty HydraJTI on validate failure, got %q", pub.authSessions[0].HydraJTI)
+	}
+}
+
+func TestLogin_NoSynchronousDeviceSessionSave(t *testing.T) {
+	saveCalled := false
+	d := &mockDeviceSessionRepo{
+		saveDeviceSessionFunc: func(_ context.Context, _ *domain.DeviceSession) error {
+			saveCalled = true
+			return nil
+		},
+	}
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+	}
+	r := &mockRedisRepo{saveLoginFunc: noopSaveLogin}
+
+	svc := service.NewOryAuthService(h, r, d)
+	if _, _, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if saveCalled {
+		t.Error("SaveDeviceSession must not be called synchronously in Login (async via Kafka consumer)")
+	}
+}
+
+func TestLogin_PublishedEventTimestampIsRFC3339Nano(t *testing.T) {
+	pub := &mockEventPublisher{}
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+	}
+	r := &mockRedisRepo{saveLoginFunc: noopSaveLogin}
+
+	svc := service.NewOryAuthService(h, r, &mockDeviceSessionRepo{}, service.WithEventPublisher(pub))
+	if _, _, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pub.authSessions) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(pub.authSessions))
+	}
+	if _, err := time.Parse(time.RFC3339Nano, pub.authSessions[0].Timestamp); err != nil {
+		t.Errorf("Timestamp %q is not RFC3339Nano: %v", pub.authSessions[0].Timestamp, err)
+	}
+}
+
+func TestLogin_IPAndUserAgent_InPublishedEvent(t *testing.T) {
+	pub := &mockEventPublisher{}
+	h := &mockHydraClient{
+		issueTokensFunc: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return goodTokens(), nil
+		},
+	}
+	r := &mockRedisRepo{saveLoginFunc: noopSaveLogin}
+	ua := "Mozilla/5.0"
+	ip := "10.0.0.1"
+
+	svc := service.NewOryAuthService(h, r, &mockDeviceSessionRepo{}, service.WithEventPublisher(pub))
+	if _, _, err := svc.Login(context.Background(), "k1", "d1", false, &ua, &ip); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(pub.authSessions) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(pub.authSessions))
+	}
+	ev := pub.authSessions[0]
+	if ev.IPAddress != "10.0.0.1" {
+		t.Errorf("IPAddress: want 10.0.0.1, got %q", ev.IPAddress)
+	}
+	if ev.UserAgent != "Mozilla/5.0" {
+		t.Errorf("UserAgent: want Mozilla/5.0, got %q", ev.UserAgent)
 	}
 }

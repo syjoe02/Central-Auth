@@ -97,4 +97,16 @@ func (s *InstrumentedAuthService) Signup(ctx context.Context, email, password st
 	return id, err
 }
 
+func (s *InstrumentedAuthService) GoogleLogin(ctx context.Context, email, deviceID string, rememberMe bool, userAgent, ip *string) (string, string, error) {
+	start := time.Now()
+	access, refresh, err := s.delegate.GoogleLogin(ctx, email, deviceID, rememberMe, userAgent, ip)
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	metrics.AuthOps.WithLabelValues("google_login", result).Inc()
+	metrics.OryOps.WithLabelValues("kratos_get_by_email").Observe(time.Since(start).Seconds())
+	return access, refresh, err
+}
+
 var _ AuthServiceI = (*InstrumentedAuthService)(nil)

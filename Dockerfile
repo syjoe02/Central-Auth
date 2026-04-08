@@ -18,5 +18,6 @@ COPY --from=builder /app/central-auth .
 
 EXPOSE 8081
 EXPOSE 9091
+EXPOSE 50051
 
 CMD ["./central-auth"]

@@ -34,3 +34,5 @@ env/
 
 # ===== Docker =====
 docker-data/
+# gRPC generated stubs (run 'make proto-gen' to regenerate)
+gen/

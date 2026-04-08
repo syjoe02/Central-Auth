@@ -10,10 +10,11 @@ import (
 
 	"central-auth/internal/blacklist"
 	"central-auth/internal/config"
-	"central-auth/internal/domain"
 	"central-auth/internal/hydra"
+	kafkapkg "central-auth/internal/kafka"
 	"central-auth/internal/metrics"
 	"central-auth/internal/repository"
+	"central-auth/internal/resilience"
 	"central-auth/internal/session"
 )
 
@@ -46,9 +47,12 @@ type BFFService struct {
 	redisRepo         repository.RedisRepo
 	deviceSessionRepo repository.DeviceSessionRepository
 	cfg               config.BFFConfig
+	publisher         kafkapkg.EventPublisher
 }
 
 // NewBFFService constructs a BFFService with all required dependencies.
+// publisher receives AuthSessionEvents after each successful BFF login.
+// Pass &kafka.NoopPublisher{} in tests or when Kafka is unavailable.
 func NewBFFService(
 	hydraClient hydra.ClientI,
 	store session.Store,
@@ -56,6 +60,7 @@ func NewBFFService(
 	redisRepo repository.RedisRepo,
 	deviceSessionRepo repository.DeviceSessionRepository,
 	cfg config.BFFConfig,
+	publisher kafkapkg.EventPublisher,
 ) *BFFService {
 	return &BFFService{
 		hydra:             hydraClient,
@@ -64,6 +69,7 @@ func NewBFFService(
 		redisRepo:         redisRepo,
 		deviceSessionRepo: deviceSessionRepo,
 		cfg:               cfg,
+		publisher:         publisher,
 	}
 }
 
@@ -83,6 +89,11 @@ func (s *BFFService) Login(
 		return "", fmt.Errorf("bff login: issue tokens: %w", err)
 	}
 
+	// ValidateAccessToken is fatal here (unlike OryAuthService.Login where it is
+	// non-fatal). The BFF path requires claims.ID (JTI) for AuthSessionEvent and
+	// claims.ExpiresAt to populate BFFSession.AccessTokenExp. Without these the
+	// session cannot be constructed correctly, so we fail the login rather than
+	// silently issuing a session with a zero expiry or missing JTI correlation.
 	claims, err := s.hydra.ValidateAccessToken(ctx, tokens.AccessToken)
 	if err != nil {
 		return "", fmt.Errorf("bff login: parse access token: %w", err)
@@ -127,16 +138,17 @@ func (s *BFFService) Login(
 		log.Printf("[WARN] bff login: Redis SaveLogin failed (non-fatal): %v", err)
 	}
 
-	if err := s.deviceSessionRepo.SaveDeviceSession(ctx, &domain.DeviceSession{
+	// claims.ID is the JTI from jwt.RegisteredClaims — already parsed above.
+	// Publish non-blocking; the DeviceSessionConsumer persists to device_sessions.
+	s.publisher.PublishAuthSession(kafkapkg.AuthSessionEvent{
+		EventType: "auth.session.created",
 		KratosID:  kratosID,
 		DeviceID:  deviceID,
-		IssuedAt:  now,
-		UserAgent: userAgent,
-		IP:        ip,
-		Revoked:   false,
-	}); err != nil {
-		log.Printf("[WARN] bff login: Postgres SaveDeviceSession failed (non-fatal): %v", err)
-	}
+		HydraJTI:  claims.ID,
+		IPAddress: derefStr(ip),
+		UserAgent: derefStr(userAgent),
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+	})
 
 	log.Printf("[BFF] Login success kratosID=%s device=%s", kratosID, deviceID)
 	return sessionID, nil
@@ -269,8 +281,13 @@ func (s *BFFService) Logout(ctx context.Context, sessionID string) error {
 	}
 
 	// Blacklist-first: abort if this fails to prevent partial revocation.
+	// ErrRedisUnavailable means the session was written to PostgreSQL + L1 cache
+	// by the resilient blacklist — the session is still revoked, so logout may proceed.
 	if err := s.blacklist.Add(ctx, sessionID, time.Until(sess.ExpiresAt)); err != nil {
-		return fmt.Errorf("bff logout: blacklist session: %w", err)
+		if !errors.Is(err, resilience.ErrRedisUnavailable) {
+			return fmt.Errorf("bff logout: blacklist session: %w", err)
+		}
+		log.Printf("[WARN] bff logout: Redis unavailable, session blacklisted via PG fallback: %v", err)
 	}
 
 	if err := s.hydra.RevokeToken(ctx, sess.HydraRefreshToken); err != nil {
@@ -327,7 +344,10 @@ func (s *BFFService) LogoutAll(ctx context.Context, sessionID string) error {
 	}
 
 	if err := s.blacklist.AddBatch(ctx, sessionIDs, maxTTL); err != nil {
-		return fmt.Errorf("bff logout-all: blacklist sessions: %w", err)
+		if !errors.Is(err, resilience.ErrRedisUnavailable) {
+			return fmt.Errorf("bff logout-all: blacklist sessions: %w", err)
+		}
+		log.Printf("[WARN] bff logout-all: Redis unavailable, sessions blacklisted via PG fallback: %v", err)
 	}
 
 	if err := s.hydra.RevokeAllForSubject(ctx, kratosID); err != nil {

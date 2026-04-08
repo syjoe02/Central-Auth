@@ -36,3 +36,14 @@ CREATE INDEX IF NOT EXISTS idx_device_sessions_kratos
 CREATE INDEX IF NOT EXISTS idx_device_sessions_active
     ON device_sessions(kratos_id)
     WHERE revoked = false;
+
+-- blacklisted_sessions is the PostgreSQL fallback for the Redis-backed session blacklist.
+-- Consulted only when the Redis circuit breaker is OPEN and the L1 in-process cache misses.
+-- Redis remains the primary store; this table provides blacklist durability during outages.
+CREATE TABLE IF NOT EXISTS blacklisted_sessions (
+    session_id TEXT        PRIMARY KEY,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_blacklisted_sessions_expires_at
+    ON blacklisted_sessions(expires_at);

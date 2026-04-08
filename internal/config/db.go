@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"time"
@@ -20,12 +21,21 @@ func NewRedisClient() *redis.Client {
 		addr = "localhost:6379"
 	}
 
+	// Log only the host:port — never log the full DSN or any password.
+	log.Printf("[INFO] Redis client connecting to %s", addr)
+
 	return redis.NewClient(&redis.Options{
-		Addr: addr,
+		Addr:         addr,
+		DialTimeout:  time.Duration(envInt("REDIS_DIAL_TIMEOUT_MS", 100)) * time.Millisecond,
+		ReadTimeout:  time.Duration(envInt("REDIS_READ_TIMEOUT_MS", 500)) * time.Millisecond,
+		WriteTimeout: time.Duration(envInt("REDIS_WRITE_TIMEOUT_MS", 500)) * time.Millisecond,
 	})
 }
 
-func NewPostgresConn() (*pgxpool.Pool, error) {
+// PostgresDSN constructs the postgres:// connection string from environment
+// variables. It is exported so that callers such as the migration runner can
+// obtain the DSN without also creating a pgxpool.
+func PostgresDSN() string {
 	host := os.Getenv("POSTGRES_HOST")
 	port := os.Getenv("POSTGRES_PORT")
 	user := os.Getenv("POSTGRES_USER")
@@ -34,16 +44,19 @@ func NewPostgresConn() (*pgxpool.Pool, error) {
 	sslmode := os.Getenv("POSTGRES_SSLMODE")
 
 	if host == "" {
-		// Local fallback
 		host = "localhost"
 	}
 	if sslmode == "" {
 		sslmode = "require"
 	}
 
-	dsn := "postgres://" + user + ":" + password +
+	return "postgres://" + user + ":" + password +
 		"@" + host + ":" + port + "/" + db +
 		"?sslmode=" + sslmode
+}
+
+func NewPostgresConn() (*pgxpool.Pool, error) {
+	dsn := PostgresDSN()
 
 	poolCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {

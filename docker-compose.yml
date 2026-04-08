@@ -53,6 +53,7 @@ services:
     image: oryd/kratos:v1.3.0
     container_name: central-auth-kratos
     env_file:
+      - ../.env.shared
       - ./env/.env.prod
     ports:
       - "4433:4433" # public
@@ -94,6 +95,7 @@ services:
     image: oryd/hydra:v2.3.0
     container_name: central-auth-hydra
     env_file:
+      - ../.env.shared
       - ./env/.env.prod
     ports:
       - "4444:4444" # public (OAuth2 endpoints)
@@ -107,7 +109,9 @@ services:
       DB_MAX_IDLE_CONNS: 5
       DB_CONN_MAX_LIFETIME: 3600
       SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET}
-      URLS_SELF_ISSUER: http://localhost:4444/
+      # ADR-001: canonical issuer sourced from .env.shared (URLS_SELF_ISSUER=http://hydra:4444/)
+      # Invariant: URLS_SELF_ISSUER == Go BFF expected issuer == Django EXPECTED_JWT_ISSUER
+      URLS_SELF_ISSUER: ${URLS_SELF_ISSUER}
       URLS_LOGIN: http://auth-server:8081/hydra/login
       URLS_CONSENT: http://auth-server:8081/hydra/consent
       URLS_LOGOUT: http://auth-server:8081/hydra/logout
@@ -159,6 +163,7 @@ services:
       - "8081:8081"
     expose:
       - "9091"
+      - "50051"
     depends_on:
       redis:
         condition: service_started
@@ -169,6 +174,7 @@ services:
       hydra:
         condition: service_healthy
     env_file:
+      - ../.env.shared
       - ./env/.env.prod
     environment:
       POSTGRES_HOST: postgres
@@ -181,6 +187,7 @@ services:
       METRICS_ALLOWED_CIDR: "${METRICS_ALLOWED_CIDR:-172.20.0.0/16}"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_TOPIC: "access-logs"
+      SENTRY_DSN: ${SENTRY_DSN:-}
     networks:
       default: {}
       shared-monitor-net:
@@ -188,8 +195,28 @@ services:
           - auth-server
     restart: always
 
+  postgres-backup:
+    image: prodrigestivill/postgres-backup-local:16
+    container_name: central-auth-postgres-backup
+    restart: always
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SCHEDULE: "@daily"
+      BACKUP_KEEP_DAYS: 7
+      BACKUP_KEEP_WEEKS: 4
+      BACKUP_KEEP_MONTHS: 6
+    volumes:
+      - postgres-backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres-data:
+  postgres-backups:
 
 networks:
   shared-monitor-net:

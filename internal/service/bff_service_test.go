@@ -11,6 +11,7 @@ import (
 	"central-auth/internal/config"
 	"central-auth/internal/domain"
 	"central-auth/internal/hydra"
+	"central-auth/internal/kafka"
 	"central-auth/internal/repository"
 	"central-auth/internal/service"
 	"central-auth/internal/session"
@@ -150,12 +151,24 @@ func (m *bffMockDeviceSessionRepo) CountActiveDevices(ctx context.Context, k str
 	return 0, nil
 }
 
+// mockEventPublisher records PublishAuthSession calls for test assertions.
+type mockEventPublisher struct {
+	authSessions []kafka.AuthSessionEvent
+}
+
+func (m *mockEventPublisher) Publish(_ kafka.AccessLogEvent) {}
+func (m *mockEventPublisher) PublishAuthSession(e kafka.AuthSessionEvent) {
+	m.authSessions = append(m.authSessions, e)
+}
+func (m *mockEventPublisher) Close(_ context.Context) error { return nil }
+
 // compile-time interface checks
 var _ hydra.ClientI = (*mockHydra)(nil)
 var _ session.Store = (*mockSessionStore)(nil)
 var _ blacklist.Blacklist = (*mockBlacklist)(nil)
 var _ repository.RedisRepo = (*bffMockRedisRepo)(nil)
 var _ repository.DeviceSessionRepository = (*bffMockDeviceSessionRepo)(nil)
+var _ kafka.EventPublisher = (*mockEventPublisher)(nil)
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -175,12 +188,12 @@ func bffGoodClaims(kratosID, deviceID string) *hydra.AccessTokenClaims {
 	return &hydra.AccessTokenClaims{
 		Subject:          kratosID,
 		Ext:              map[string]interface{}{"device_id": deviceID},
-		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: exp},
+		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: exp, ID: "test-jti"},
 	}
 }
 
 func newBFFService(h *mockHydra, store session.Store, bl blacklist.Blacklist) *service.BFFService {
-	return service.NewBFFService(h, store, bl, &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg())
+	return service.NewBFFService(h, store, bl, &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), &kafka.NoopPublisher{})
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -574,5 +587,76 @@ func TestBFFService_LogoutAll_RevokeSubjectFailure_ReturnsError(t *testing.T) {
 	if err == nil {
 		t.Error("expected error when RevokeAllForSubject fails")
 	}
+}
+
+func TestBFFService_Login_PublishesAuthSessionEvent_WithJTI(t *testing.T) {
+	store := newMockStore()
+	pub := &mockEventPublisher{}
+	h := &mockHydra{
+		issueTokensFn: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return &hydra.TokenSet{AccessToken: "at", RefreshToken: "rt"}, nil
+		},
+		validateAccessTokenFn: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return bffGoodClaims("kratos1", "dev1"), nil
+		},
+	}
+	svc := service.NewBFFService(h, store, newMockBlacklist(), &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), pub)
+
+	_, err := svc.Login(context.Background(), "kratos1", "dev1", false, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(pub.authSessions) != 1 {
+		t.Fatalf("expected 1 AuthSessionEvent published, got %d", len(pub.authSessions))
+	}
+	ev := pub.authSessions[0]
+	if ev.EventType != "auth.session.created" {
+		t.Errorf("EventType: want auth.session.created, got %s", ev.EventType)
+	}
+	if ev.KratosID != "kratos1" {
+		t.Errorf("KratosID: want kratos1, got %s", ev.KratosID)
+	}
+	if ev.DeviceID != "dev1" {
+		t.Errorf("DeviceID: want dev1, got %s", ev.DeviceID)
+	}
+	if ev.HydraJTI != "test-jti" {
+		t.Errorf("HydraJTI: want test-jti, got %s", ev.HydraJTI)
+	}
+}
+
+func TestBFFService_Login_NoSynchronousDeviceSessionSave(t *testing.T) {
+	saveCalled := false
+	repo := &trackingDeviceSessionRepo{onSave: func() { saveCalled = true }}
+
+	h := &mockHydra{
+		issueTokensFn: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return &hydra.TokenSet{AccessToken: "at", RefreshToken: "rt"}, nil
+		},
+		validateAccessTokenFn: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return bffGoodClaims("k1", "d1"), nil
+		},
+	}
+	svc := service.NewBFFService(h, newMockStore(), newMockBlacklist(), &bffMockRedisRepo{}, repo, testCfg(), &kafka.NoopPublisher{})
+
+	if _, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if saveCalled {
+		t.Error("SaveDeviceSession must not be called synchronously in BFF Login (async via Kafka consumer)")
+	}
+}
+
+// trackingDeviceSessionRepo lets tests observe SaveDeviceSession calls.
+type trackingDeviceSessionRepo struct {
+	bffMockDeviceSessionRepo
+	onSave func()
+}
+
+func (r *trackingDeviceSessionRepo) SaveDeviceSession(_ context.Context, _ *domain.DeviceSession) error {
+	if r.onSave != nil {
+		r.onSave()
+	}
+	return nil
 }
 

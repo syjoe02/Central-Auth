@@ -3,6 +3,7 @@ package config
 import (
 	"log"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -15,6 +16,9 @@ type ServerConfig struct {
 	// TrustedProxyCIDRs is passed to gin.SetTrustedProxies to prevent
 	// X-Forwarded-For spoofing. Defaults to the Docker bridge subnet.
 	TrustedProxyCIDRs []string
+	// RateLimitRequestsPerMin is used by the gRPC rate-limit interceptor.
+	// 0 means disabled (default in dev; set in production via RATE_LIMIT_REQUESTS_PER_MIN).
+	RateLimitRequestsPerMin int
 }
 
 // splitAndTrim splits a comma-separated string and trims whitespace from each element.
@@ -81,11 +85,19 @@ func LoadServerConfig() ServerConfig {
 		trustedCIDRs = splitAndTrim(v)
 	}
 
+	rateLimitRPM := 0
+	if v := os.Getenv("RATE_LIMIT_REQUESTS_PER_MIN"); v != "" {
+		if n, parseErr := strconv.Atoi(v); parseErr == nil && n >= 0 {
+			rateLimitRPM = n
+		}
+	}
+
 	return ServerConfig{
 		ServiceAPIKey:            key,
 		AppEnv:                   appEnv,
 		MetricsBasicAuthUser:     metricsUser,
 		MetricsBasicAuthPassword: metricsPass,
 		TrustedProxyCIDRs:        trustedCIDRs,
+		RateLimitRequestsPerMin:  rateLimitRPM,
 	}
 }

@@ -22,6 +22,7 @@ func LoadCORSOrigins(appEnv string) []string {
 		if appEnv == "production" {
 			log.Fatalf("[FATAL] CORS_ALLOWED_ORIGINS must be a non-wildcard whitelist in production")
 		}
+		// TODO: Restrict to production domains — pre-domain dev stage only.
 		log.Println("[WARN] CORS_ALLOWED_ORIGINS not set or is wildcard — all origins allowed; do NOT use in production")
 		return nil
 	}
