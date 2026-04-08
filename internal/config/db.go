@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"time"
@@ -20,8 +21,14 @@ func NewRedisClient() *redis.Client {
 		addr = "localhost:6379"
 	}
 
+	// Log only the host:port — never log the full DSN or any password.
+	log.Printf("[INFO] Redis client connecting to %s", addr)
+
 	return redis.NewClient(&redis.Options{
-		Addr: addr,
+		Addr:         addr,
+		DialTimeout:  time.Duration(envInt("REDIS_DIAL_TIMEOUT_MS", 100)) * time.Millisecond,
+		ReadTimeout:  time.Duration(envInt("REDIS_READ_TIMEOUT_MS", 500)) * time.Millisecond,
+		WriteTimeout: time.Duration(envInt("REDIS_WRITE_TIMEOUT_MS", 500)) * time.Millisecond,
 	})
 }
 

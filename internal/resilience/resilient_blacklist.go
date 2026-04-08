@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"time"
 
 	gocache "github.com/patrickmn/go-cache"
@@ -13,12 +14,23 @@ import (
 	"central-auth/internal/requestid"
 )
 
-// logWithReqID prefixes the request ID from ctx (if any) to the log line.
-func logWithReqID(ctx context.Context, format string, args ...any) {
+// logWriter delegates to the standard log.Writer() so that tests can redirect
+// output via log.SetOutput and capture structured slog lines in a buffer.
+type logWriter struct{}
+
+func (logWriter) Write(p []byte) (int, error) { return log.Writer().Write(p) }
+
+// resilienceLogger emits structured JSON for Loki ingestion.
+// Writing through logWriter (not os.Stdout directly) allows tests to redirect
+// log output via log.SetOutput without re-initialising the slog handler.
+var resilienceLogger = slog.New(slog.NewJSONHandler(logWriter{}, nil)).With(slog.String("service", "central-auth"))
+
+// logWithReqID emits a structured JSON log line, adding "request_id" from ctx when present.
+func logWithReqID(ctx context.Context, level slog.Level, msg string, args ...any) {
 	if rid := requestid.FromContext(ctx); rid != "" {
-		format = "[" + rid + "] " + format
+		args = append([]any{slog.String("request_id", rid)}, args...)
 	}
-	log.Printf(format, args...)
+	resilienceLogger.Log(ctx, level, msg, args...)
 }
 
 // ResilientBlacklist wraps blacklist.Blacklist with circuit-breaker protection,
@@ -74,11 +86,11 @@ func (r *ResilientBlacklist) IsBlacklisted(ctx context.Context, sessionID string
 	result, err := r.pgRepo.IsBlacklisted(ctx, sessionID)
 	if err != nil {
 		// FAIL-CLOSED: PG error → deny access.
-		logWithReqID(ctx, "[ERROR] blacklist: pg fallback is_blacklisted failed (fail-closed): %v", err)
+		logWithReqID(ctx, slog.LevelError, "blacklist: pg fallback is_blacklisted failed (fail-closed)", "error", err)
 		return true, fmt.Errorf("blacklist: pg fallback is_blacklisted: %w", err)
 	}
 	PgFallbackTotal.WithLabelValues("is_blacklisted").Inc()
-	logWithReqID(ctx, "[INFO] blacklist: pg fallback is_blacklisted hit sessionID=%s result=%v", sessionID, result)
+	logWithReqID(ctx, slog.LevelInfo, "blacklist: pg fallback is_blacklisted hit", "session_id", sessionID, "result", result)
 	r.l1.Set(sessionID, result, gocache.DefaultExpiration)
 	return result, nil
 }
@@ -105,13 +117,73 @@ func (r *ResilientBlacklist) Add(ctx context.Context, sessionID string, ttl time
 	// OPEN path: dual-write to PG + L1.
 	expiresAt := time.Now().Add(ttl)
 	if pgErr := r.pgRepo.Add(ctx, sessionID, expiresAt); pgErr != nil {
-		logWithReqID(ctx, "[ERROR] blacklist: pg fallback add failed sessionID=%s: %v", sessionID, pgErr)
+		logWithReqID(ctx, slog.LevelError, "blacklist: pg fallback add failed", "session_id", sessionID, "error", pgErr)
 		return fmt.Errorf("blacklist: pg fallback add: %w", pgErr)
 	}
 	PgFallbackTotal.WithLabelValues("add").Inc()
-	logWithReqID(ctx, "[WARN] blacklist: Redis unavailable, wrote sessionID=%s to PG+L1 fallback", sessionID)
+	logWithReqID(ctx, slog.LevelWarn, "blacklist: Redis unavailable, wrote to PG+L1 fallback", "session_id", sessionID)
 	r.l1.Set(sessionID, true, ttl)
 	return ErrRedisUnavailable
+}
+
+// StartBackgroundSync launches a goroutine that re-syncs all active blacklisted
+// JTIs from PostgreSQL into the L1 cache every syncInterval (typically 1 minute).
+// The sync only runs while the circuit is OPEN, where per-request PG lookups would
+// otherwise cause a query spike on every IsBlacklisted call.
+//
+// The goroutine exits cleanly when ctx is cancelled (e.g. on graceful shutdown).
+// Call once from main after constructing the ResilientBlacklist.
+func (r *ResilientBlacklist) StartBackgroundSync(ctx context.Context, syncInterval time.Duration) {
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				resilienceLogger.LogAttrs(ctx, slog.LevelError,
+					"blacklist: bg sync goroutine recovered from panic",
+					slog.Any("panic", p),
+				)
+			}
+		}()
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if r.cb.State() == StateOpen {
+					r.syncFromPG(ctx)
+				}
+			}
+		}
+	}()
+}
+
+// syncFromPG fetches all non-expired blacklist rows from PostgreSQL and stores
+// them in the L1 cache. Each entry gets a TTL matching its remaining lifetime.
+func (r *ResilientBlacklist) syncFromPG(ctx context.Context) {
+	entries, err := r.pgRepo.ListActive(ctx)
+	if err != nil {
+		resilienceLogger.LogAttrs(ctx, slog.LevelError,
+			"blacklist: bg sync list_active failed",
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	now := time.Now()
+	loaded := 0
+	for _, e := range entries {
+		ttl := e.ExpiresAt.Sub(now)
+		if ttl <= 0 {
+			continue // race: expired between query and now — skip
+		}
+		r.l1.Set(e.SessionID, true, ttl)
+		loaded++
+	}
+	resilienceLogger.LogAttrs(ctx, slog.LevelInfo,
+		"blacklist: bg sync completed",
+		slog.Int("loaded", loaded),
+		slog.String("circuit_state", "OPEN"),
+	)
 }
 
 // AddBatch blacklists multiple sessions. Falls back to per-session PG writes when OPEN.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -40,12 +41,23 @@ import (
 )
 
 func main() {
+	// ── Default structured logger (service field propagated to all slog.* calls) ─
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)).With(slog.String("service", "central-auth")))
+
 	// ── Sentry (optional; disabled when SENTRY_DSN is empty) ────────────────
 	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
 		if err := sentry.Init(sentry.ClientOptions{
 			Dsn:              dsn,
 			Environment:      os.Getenv("APP_ENV"),
 			TracesSampleRate: 0.1,
+			// AttachStacktrace: true causes sentry-go to capture a runtime stack trace
+			// for every CaptureMessage and CaptureException call, including circuit-breaker
+			// state-change callbacks.  This ensures level=error/fatal events always include
+			// a full Go stack in the Sentry UI, not just a bare message string.
+			AttachStacktrace: true,
+			// ProfilesSampleRate: 0.1 — field does not exist in sentry-go v0.44.1.
+			// TODO: Add ProfilesSampleRate: 0.1 when upgrading to a release that includes
+			// the profiling integration in ClientOptions (target: 0.1 to limit overhead/PII).
 		}); err != nil {
 			log.Printf("[WARN] Sentry init failed: %v", err)
 		} else {
@@ -99,7 +111,27 @@ func main() {
 		ProbeBaseNanos:   int64(resilienceCfg.ProbeBaseSeconds) * int64(time.Second),
 		ProbeMaxNanos:    int64(resilienceCfg.ProbeMaxSeconds) * int64(time.Second),
 		JitterPct:        int64(resilienceCfg.JitterPct),
-	})
+	}, resilience.WithOnStateChange(func(from, to resilience.State) {
+		sentry.WithScope(func(scope *sentry.Scope) {
+			scope.SetTag("from_state", from.String())
+			scope.SetTag("to_state", to.String())
+			scope.SetTag("target", "redis")
+			if to == resilience.StateOpen {
+				// CLOSED → OPEN is a fatal infrastructure event.
+				// CaptureException sends the error as an *exception* event in Sentry,
+				// which (combined with AttachStacktrace: true) includes a full Go stack
+				// trace so engineers can pinpoint the call site that tripped the breaker.
+				scope.SetTag("alert_id", "REDIS_DOWN_CIRCUIT_OPEN")
+				scope.SetLevel(sentry.LevelFatal)
+				sentry.CaptureException(fmt.Errorf("redis circuit breaker: %s → %s", from, to))
+			} else {
+				// OPEN → HALF-OPEN or HALF-OPEN → CLOSED are informational.
+				// CaptureMessage is sufficient; AttachStacktrace still adds a stack.
+				scope.SetLevel(sentry.LevelWarning)
+				sentry.CaptureMessage(fmt.Sprintf("circuit breaker: %s → %s", from, to))
+			}
+		})
+	}))
 	l1Cache := gocache.New(1*time.Minute, 2*time.Minute)
 
 	// ── Repositories ─────────────────────────────────────────────────────────
@@ -113,6 +145,14 @@ func main() {
 	resilientSessionStore := resilience.NewResilientSessionStore(rawSessionStore, cb, l1Cache)
 	resilientBlacklist    := resilience.NewResilientBlacklist(rawBlacklist, cb, l1Cache, blacklistPgRepo)
 	idempotencyCache      := resilience.NewResilientIdempotencyCache(rdb, cb)
+
+	// Background blacklist sync — when the circuit is OPEN, periodically bulk-loads
+	// all active blacklisted JTIs from PostgreSQL into the L1 cache.
+	// This prevents a per-request PG lookup spike during Redis outages.
+	// The sync context is cancelled during graceful shutdown (see shutdownDone below).
+	bgSyncCtx, bgSyncCancel := context.WithCancel(context.Background())
+	resilientBlacklist.StartBackgroundSync(bgSyncCtx, 1*time.Minute)
+	log.Println("[INFO] Blacklist background sync started (interval: 1m)")
 
 	// Instrumented wrapper sits outside the resilient layer so Prometheus latency
 	// metrics reflect actual attempt counts (not CB fast-fails).
@@ -366,11 +406,9 @@ func main() {
 		}()
 		httpWg.Wait() // H-3: no more Publish calls possible after this point
 
-		// ── Phase 1.5: stop device-session consumer ───────────────────────────
-		// consumerCancel is always safe to call (it is either a real cancel func
-		// or the no-op default set above). The nil check guards RunDone/Close
-		// for the case where the consumer was never started.
-		consumerCancel()
+		// ── Phase 1.5: stop background goroutines ────────────────────────────
+		bgSyncCancel()    // stop blacklist background sync
+		consumerCancel()  // stop device-session Kafka consumer
 		if deviceSessionConsumer != nil {
 			<-deviceSessionConsumer.RunDone()
 			if err := deviceSessionConsumer.Close(); err != nil {
