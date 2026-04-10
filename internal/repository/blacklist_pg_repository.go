@@ -9,6 +9,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// BlacklistEntry is a single row returned by ListActive.
+type BlacklistEntry struct {
+	SessionID string
+	ExpiresAt time.Time
+}
+
 // BlacklistPgRepository is the PostgreSQL fallback for the session blacklist.
 // It is consulted only when the Redis circuit breaker is OPEN and the L1 cache misses.
 // Redis remains the primary source of truth; this table provides durability during outages.
@@ -21,6 +27,10 @@ type BlacklistPgRepository interface {
 	Add(ctx context.Context, sessionID string, expiresAt time.Time) error
 	// DeleteExpired removes rows whose expires_at <= NOW(). Optional maintenance.
 	DeleteExpired(ctx context.Context) error
+	// ListActive returns all non-expired entries for bulk L1 cache warm-up.
+	// Used by the background sync goroutine to pre-populate the in-process cache
+	// when the circuit is OPEN, avoiding per-request PG lookups.
+	ListActive(ctx context.Context) ([]BlacklistEntry, error)
 }
 
 // PostgresBlacklistRepository implements BlacklistPgRepository using pgx.
@@ -67,6 +77,31 @@ func (r *PostgresBlacklistRepository) Add(ctx context.Context, sessionID string,
 		return fmt.Errorf("blacklist pg: add %q: %w", sessionID, err)
 	}
 	return nil
+}
+
+// ListActive returns all non-expired blacklist entries ordered by expiry.
+// Used by the background sync goroutine to bulk-warm the L1 cache.
+func (r *PostgresBlacklistRepository) ListActive(ctx context.Context) ([]BlacklistEntry, error) {
+	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
+	defer cancel()
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT session_id, expires_at FROM blacklisted_sessions WHERE expires_at > NOW() ORDER BY expires_at`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("blacklist pg: list_active: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []BlacklistEntry
+	for rows.Next() {
+		var e BlacklistEntry
+		if err := rows.Scan(&e.SessionID, &e.ExpiresAt); err != nil {
+			return nil, fmt.Errorf("blacklist pg: list_active scan: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
 }
 
 // DeleteExpired removes rows whose expiry has passed. Intended for periodic maintenance.

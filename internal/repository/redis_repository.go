@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -114,28 +115,61 @@ func (r *RedisRepository) RotateRefreshToken(ctx context.Context, kratosID, devi
 	return r.client.Set(ctx, refreshKey(kratosID, deviceID), newToken, ttl).Err()
 }
 
-// LogoutDevice atomically removes the device from the devices set and deletes
-// the stored refresh token.
+// logoutDeviceScript atomically removes a single device from the user's device
+// ZSET and deletes its stored Hydra refresh token.
+//
+// Using Lua instead of a pipeline ensures both operations execute as a single
+// atomic unit in Redis, with no window between ZREM and DEL where a concurrent
+// login could observe an inconsistent state (device gone from ZSET but token still present).
+//
+// KEYS[1] = devicesKey  (auth:devices:<kratosID>)
+// KEYS[2] = refreshKey  (auth:refresh:<kratosID>:<deviceID>)
+// ARGV[1] = deviceID member string
+// Returns the number of members removed from the ZSET (0 = device was not active).
+var logoutDeviceScript = redis.NewScript(`
+local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
+return removed
+`)
+
+// LogoutDevice atomically removes the device from the devices ZSET and deletes
+// the stored refresh token via a Lua script, ensuring consistency under concurrent logins.
 func (r *RedisRepository) LogoutDevice(ctx context.Context, kratosID, deviceID string) error {
-	pipe := r.client.TxPipeline()
-	pipe.Del(ctx, refreshKey(kratosID, deviceID))
-	pipe.ZRem(ctx, devicesKey(kratosID), deviceID)
-	_, err := pipe.Exec(ctx)
-	return err
+	return logoutDeviceScript.Run(ctx, r.client,
+		[]string{devicesKey(kratosID), refreshKey(kratosID, deviceID)},
+		deviceID,
+	).Err()
 }
 
-// LogoutAll atomically removes all device entries and their refresh tokens for the identity.
+// logoutAllChunkSize is the maximum number of DEL commands sent per pipeline
+// batch in LogoutAll. Keeping batches small prevents Redis from blocking on a
+// single MULTI/EXEC transaction while a user has many active devices.
+const logoutAllChunkSize = 50
+
+// LogoutAll removes all device entries and their refresh tokens for the identity.
+// Refresh token DELs are issued in chunks of logoutAllChunkSize via non-transactional
+// pipelines to prevent Redis blocking on large device sets. The device ZSET key is
+// deleted last, after all token DELs have succeeded, to maintain a consistent state.
 func (r *RedisRepository) LogoutAll(ctx context.Context, kratosID string) error {
 	dKey := devicesKey(kratosID)
 	deviceIDs, err := r.client.ZRange(ctx, dKey, 0, -1).Result()
 	if err != nil {
 		return err
 	}
-	pipe := r.client.TxPipeline()
-	for _, deviceID := range deviceIDs {
-		pipe.Del(ctx, refreshKey(kratosID, deviceID))
+	// Delete refresh tokens in chunks to prevent Redis blocking on large device sets.
+	for i := 0; i < len(deviceIDs); i += logoutAllChunkSize {
+		end := i + logoutAllChunkSize
+		if end > len(deviceIDs) {
+			end = len(deviceIDs)
+		}
+		pipe := r.client.Pipeline()
+		for _, deviceID := range deviceIDs[i:end] {
+			pipe.Del(ctx, refreshKey(kratosID, deviceID))
+		}
+		if _, err := pipe.Exec(ctx); err != nil {
+			return fmt.Errorf("LogoutAll: chunk %d-%d: %w", i, end, err)
+		}
 	}
-	pipe.Del(ctx, dKey)
-	_, err = pipe.Exec(ctx)
-	return err
+	// Delete the ZSET after all tokens are gone.
+	return r.client.Del(ctx, dKey).Err()
 }

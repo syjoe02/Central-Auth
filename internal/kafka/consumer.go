@@ -52,7 +52,7 @@ func NewDeviceSessionConsumer(cfg config.KafkaConfig, repo repository.DeviceSess
 	return &DeviceSessionConsumer{
 		reader:  reader,
 		repo:    repo,
-		logger:  slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		logger:  slog.New(slog.NewJSONHandler(os.Stdout, nil)).With(slog.String("service", "central-auth")),
 		runDone: make(chan struct{}),
 	}
 }

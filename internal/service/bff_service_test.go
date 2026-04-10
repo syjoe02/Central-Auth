@@ -160,7 +160,8 @@ func (m *mockEventPublisher) Publish(_ kafka.AccessLogEvent) {}
 func (m *mockEventPublisher) PublishAuthSession(e kafka.AuthSessionEvent) {
 	m.authSessions = append(m.authSessions, e)
 }
-func (m *mockEventPublisher) Close(_ context.Context) error { return nil }
+func (m *mockEventPublisher) PublishBlacklistSync(_ kafka.BlacklistSyncEvent) {}
+func (m *mockEventPublisher) Close(_ context.Context) error                   { return nil }
 
 // compile-time interface checks
 var _ hydra.ClientI = (*mockHydra)(nil)

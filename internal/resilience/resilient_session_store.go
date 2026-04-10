@@ -2,6 +2,7 @@ package resilience
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	gocache "github.com/patrickmn/go-cache"
@@ -65,7 +66,7 @@ func (s *ResilientSessionStore) Get(ctx context.Context, sessionID string) (sess
 	if err != nil {
 		if IsInfraError(err) {
 			s.cb.RecordFailure()
-			logWithReqID(ctx, "[ERROR] session store: Redis infra error on Get sessionID=%s: %v", sessionID, err)
+			logWithReqID(ctx, slog.LevelError, "session store: Redis infra error on Get", "session_id", sessionID, "error", err)
 			return session.BFFSession{}, session.ErrNotFound
 		}
 		// Domain error (ErrNotFound, etc.) — not an infra failure.

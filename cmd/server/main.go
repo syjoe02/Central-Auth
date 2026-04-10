@@ -160,6 +160,7 @@ func main() {
 	deviceSessionRepo := repository.NewInstrumentedDeviceSessionRepository(
 		repository.NewPostgresDeviceSessionRepository(pgPool),
 	)
+	globalBlacklistRepo := repository.NewPostgresGlobalBlacklistRepository(pgPool)
 
 	// ── Ory clients ──────────────────────────────────────────────────────────
 	hydraClient := hydraclient.New(
@@ -209,6 +210,9 @@ func main() {
 	// ── BFF session layer ─────────────────────────────────────────────────────
 	bffService := service.NewBFFService(hydraClient, resilientSessionStore, resilientBlacklist, redisRepo, deviceSessionRepo, bffConfig, kafkaProducer)
 
+	// ── Admin blacklist service ───────────────────────────────────────────────
+	adminBlacklistSvc := service.NewAdminBlacklistService(globalBlacklistRepo, deviceSessionRepo, kafkaProducer)
+
 	// ── Proxy config (Django API gateway) ────────────────────────────────────
 	proxyConfig, err := config.LoadProxyConfig()
 	if err != nil {
@@ -223,6 +227,7 @@ func main() {
 	authHandler := handler.NewAuthHandler(authService)
 	bffHandler := handler.NewBFFHandler(bffService, bffConfig)
 	adminHandler := handler.NewAdminHandler(hydraClient)
+	adminBlacklistHandler := handler.NewAdminBlacklistHandler(adminBlacklistSvc)
 
 	// ── CORS origins (fail-fast in production if unset/wildcard) ─────────────
 	corsOrigins := middleware.LoadCORSOrigins(serverConfig.AppEnv)
@@ -291,12 +296,18 @@ func main() {
 	admin.Use(middleware.ServiceAuthMiddleware(serverConfig.ServiceAPIKey))
 	{
 		admin.POST("/jwks/refresh", adminHandler.RefreshJWKS)
+		admin.POST("/blacklist/block", adminBlacklistHandler.Block)
+		admin.DELETE("/blacklist/block", adminBlacklistHandler.Unblock)
 	}
 
-	// ── gRPC server (8-stage interceptor chain) ──────────────────────────────
+	// ── gRPC server (9-stage interceptor chain) ──────────────────────────────
 	// Interceptor order (outermost → innermost):
 	//   Recovery → Prometheus → RequestID → Logging →
-	//   ServiceAuth → KafkaAccessLog → RateLimit → Idempotency
+	//   ServiceAuth → KafkaAccessLog → RateLimit → RateLimitMethods → Idempotency
+	//
+	// RateLimitMethods applies tighter per-method limits on Logout and LogoutAll
+	// because they are expensive (Redis pipeline + Hydra revocation) and must be
+	// protected against bulk-revocation abuse independently of the global limit.
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			grpcinterceptor.Recovery(),
@@ -306,6 +317,10 @@ func main() {
 			grpcinterceptor.ServiceAuth(serverConfig.ServiceAPIKey),
 			grpcinterceptor.KafkaAccessLog(kafkaProducer),
 			grpcinterceptor.RateLimit(serverConfig.RateLimitRequestsPerMin),
+			grpcinterceptor.RateLimitMethods(map[string]int{
+				"/auth.v1.AuthService/Logout":    10,
+				"/auth.v1.AuthService/LogoutAll": 5,
+			}),
 			grpcinterceptor.Idempotency(idempotencyCache),
 		),
 	)

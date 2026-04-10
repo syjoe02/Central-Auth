@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"sync"
@@ -11,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -23,6 +23,20 @@ const (
 	StateOpen     State = 1 // Degraded: Redis not contacted; L1/PG fallback used.
 	StateHalfOpen State = 2 // Probing: one goroutine allowed to test Redis health.
 )
+
+// String returns a human-readable label for the state, used in logging and Sentry tags.
+func (s State) String() string {
+	switch s {
+	case StateClosed:
+		return "CLOSED"
+	case StateOpen:
+		return "OPEN"
+	case StateHalfOpen:
+		return "HALF-OPEN"
+	default:
+		return "UNKNOWN"
+	}
+}
 
 // CircuitBreaker is the public contract consumed by the resilient wrappers.
 // All methods are safe for concurrent use.
@@ -44,10 +58,18 @@ type CircuitBreaker interface {
 type CBOption func(*circuitBreaker)
 
 // WithSentryCapture overrides the function called when the circuit transitions
-// CLOSED→OPEN or when a HALF-OPEN probe fails. The default is sentry.CaptureException.
-// Inject a no-op or recording function in tests.
+// CLOSED→OPEN or when a HALF-OPEN probe fails. The default is nil (no capture).
+// Inject a recording function in tests or a real Sentry call in production.
 func WithSentryCapture(fn func(error)) CBOption {
 	return func(cb *circuitBreaker) { cb.captureFunc = fn }
+}
+
+// WithOnStateChange registers a callback that is fired on every FSM state transition.
+// The callback receives the previous and new State values and runs synchronously on the
+// goroutine that triggered the transition, so it must not block.
+// Use this in main.go to emit Sentry messages with appropriate severity levels.
+func WithOnStateChange(fn func(from, to State)) CBOption {
+	return func(cb *circuitBreaker) { cb.onStateChange = fn }
 }
 
 // circuitBreaker is the lock-free implementation of CircuitBreaker.
@@ -67,9 +89,10 @@ type circuitBreaker struct {
 	backoffMu    sync.Mutex
 	backoffNanos int64 // current probe interval in nanoseconds
 
-	cfg         ResilienceCBConfig
-	rng         *rand.Rand    // per-instance RNG seeded at construction (not shared)
-	captureFunc func(err error) // injected error reporter; default: sentry.CaptureException
+	cfg           ResilienceCBConfig
+	rng           *rand.Rand     // per-instance RNG seeded at construction (not shared)
+	captureFunc   func(err error) // injected error reporter; default: nil
+	onStateChange func(from, to State) // optional; fired synchronously on every FSM transition
 }
 
 // ResilienceCBConfig holds the numeric config needed by the circuit breaker.
@@ -87,13 +110,21 @@ func NewCircuitBreaker(cfg ResilienceCBConfig, opts ...CBOption) *circuitBreaker
 	cb := &circuitBreaker{
 		cfg:         cfg,
 		rng:         rand.New(rand.NewSource(time.Now().UnixNano())), //nolint:gosec // non-crypto RNG fine for jitter
-		captureFunc: func(err error) { sentry.CaptureException(err) },
+		captureFunc: nil, // default: no capture; inject via WithSentryCapture or use WithOnStateChange
 	}
 	cb.state.Store(int32(StateClosed))
 	for _, opt := range opts {
 		opt(cb)
 	}
 	return cb
+}
+
+// fireStateChange calls onStateChange if set. Must be called after the atomic state store
+// so that any observer reading cb.State() inside the callback sees the new state.
+func (cb *circuitBreaker) fireStateChange(from, to State) {
+	if cb.onStateChange != nil {
+		cb.onStateChange(from, to)
+	}
 }
 
 // Allow implements CircuitBreaker.
@@ -111,6 +142,7 @@ func (cb *circuitBreaker) Allow() bool {
 			return false // another goroutine won the CAS
 		}
 		CBState.Set(2)
+		cb.fireStateChange(StateOpen, StateHalfOpen)
 		// Fall through to HALF-OPEN branch to claim the probe slot.
 		fallthrough
 
@@ -123,10 +155,14 @@ func (cb *circuitBreaker) Allow() bool {
 
 // RecordSuccess implements CircuitBreaker.
 func (cb *circuitBreaker) RecordSuccess() {
+	from := State(cb.state.Load())
 	cb.probeInFlight.Store(0)
 	cb.failures.Store(0)
 	cb.state.Store(int32(StateClosed))
 	CBState.Set(0)
+	if from != StateClosed {
+		cb.fireStateChange(from, StateClosed)
+	}
 }
 
 // RecordFailure implements CircuitBreaker.
@@ -139,6 +175,7 @@ func (cb *circuitBreaker) RecordFailure() {
 		cb.nextProbeAt.Store(time.Now().UnixNano() + cb.loadBackoff())
 		cb.state.Store(int32(StateOpen))
 		CBState.Set(1)
+		cb.fireStateChange(StateHalfOpen, StateOpen)
 		if cb.captureFunc != nil {
 			cb.captureFunc(errors.New("redis circuit breaker: HALF-OPEN probe failed, returning to OPEN"))
 		}
@@ -151,6 +188,14 @@ func (cb *circuitBreaker) RecordFailure() {
 				cb.nextProbeAt.Store(time.Now().UnixNano() + cb.loadBackoff())
 				CBTripsTotal.Inc()
 				CBState.Set(1)
+				resilienceLogger.LogAttrs(context.Background(), slog.LevelError,
+					"REDIS_DOWN_FALLBACK_STARTED",
+					slog.String("event", "REDIS_DOWN_FALLBACK_STARTED"),
+					slog.String("reason", "failure threshold reached"),
+					slog.Int("failure_threshold", cb.cfg.FailureThreshold),
+					slog.String("circuit_state", "OPEN"),
+				)
+				cb.fireStateChange(StateClosed, StateOpen)
 				if cb.captureFunc != nil {
 					cb.captureFunc(errors.New("redis circuit breaker tripped: CLOSED→OPEN after failure threshold"))
 				}

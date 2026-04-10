@@ -51,30 +51,53 @@ type AuthSessionEvent struct {
 	Timestamp string `json:"timestamp"` // RFC3339Nano, UTC
 }
 
+// BlacklistSyncEvent is published to the blacklist-sync topic when an admin
+// registers or removes a global block (by KratosID, JTI, or service key).
+// All Django instances consume this topic to maintain their local L1 cache.
+//
+//   - event_type "blacklist.sync"    → add the target to the L1 cache (TTL 60 s)
+//   - event_type "blacklist.unblock" → evict the target from the L1 cache
+type BlacklistSyncEvent struct {
+	EventType   string `json:"event_type"`        // "blacklist.sync" or "blacklist.unblock"
+	TargetType  string `json:"target_type"`        // "USER", "JTI", "SERVICE_KEY"
+	TargetValue string `json:"target_value"`       // the blocked/unblocked value
+	Reason      string `json:"reason,omitempty"`   // optional human-readable reason
+	Timestamp   string `json:"timestamp"`          // RFC3339Nano, UTC
+}
+
 // EventPublisher is the interface consumed by middleware and service layer.
 // Both *Producer and *NoopPublisher satisfy it.
 type EventPublisher interface {
 	Publish(event AccessLogEvent)
 	PublishAuthSession(event AuthSessionEvent)
+	// PublishBlacklistSync fans out a global block/unblock event to the
+	// blacklist-sync topic so all Django instances update their L1 cache.
+	PublishBlacklistSync(event BlacklistSyncEvent)
 	Close(ctx context.Context) error
 }
 
-// Producer owns two background worker goroutines: one for AccessLogEvents
-// (high-frequency HTTP/gRPC path) and one for AuthSessionEvents (low-frequency
-// login path). Separating the channels prevents high-volume access logs from
-// causing head-of-line blocking on auth session events.
+// Producer owns three background worker goroutines:
+//   - access-log worker (high-frequency HTTP/gRPC path)
+//   - auth-session worker (low-frequency login path)
+//   - blacklist-sync worker (admin block/unblock events; separate topic)
 //
-// Both workers drain their channels and exit cleanly when Close is called.
+// Separating the channels prevents high-volume access logs from causing
+// head-of-line blocking on security-critical events.
+// All workers drain their channels and exit cleanly when Close is called.
 type Producer struct {
-	writer      *kafkago.Writer
-	ch          chan AccessLogEvent
-	done        chan struct{}
-	authCh      chan AuthSessionEvent
-	authDone    chan struct{}
-	closeOnce   sync.Once    // H-2: guards close(p.ch) against double-Close panics
-	dropped     atomic.Int64 // observable via central_auth_kafka_events_dropped_total
-	authDropped atomic.Int64
-	logger      *slog.Logger
+	writer          *kafkago.Writer
+	blacklistWriter *kafkago.Writer
+	ch              chan AccessLogEvent
+	done            chan struct{}
+	authCh          chan AuthSessionEvent
+	authDone        chan struct{}
+	blacklistCh     chan BlacklistSyncEvent
+	blacklistDone   chan struct{}
+	closeOnce       sync.Once    // H-2: guards close(p.ch) against double-Close panics
+	dropped         atomic.Int64 // observable via central_auth_kafka_events_dropped_total
+	authDropped     atomic.Int64
+	blacklistDropped atomic.Int64
+	logger          *slog.Logger
 }
 
 // NewProducer constructs a Producer and probes the first broker with a 5-second
@@ -83,7 +106,7 @@ type Producer struct {
 //   - cfg.IsProduction == true  → panics (process exits, no Kafka = no start)
 //   - cfg.IsProduction == false → logs warn, returns *NoopPublisher + error
 func NewProducer(cfg config.KafkaConfig) (EventPublisher, error) {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With(slog.String("service", "central-auth"))
 
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer probeCancel()
@@ -123,16 +146,37 @@ func NewProducer(cfg config.KafkaConfig) (EventPublisher, error) {
 		}),
 	}
 
+	// Dedicated writer for the blacklist-sync topic.
+	// Uses the same broker pool but a separate kafkago.Writer so that topic routing
+	// is explicit and the access-log writer's topic setting is never overridden.
+	blacklistW := &kafkago.Writer{
+		Addr:         kafkago.TCP(cfg.Brokers...),
+		Topic:        cfg.BlacklistSyncTopic,
+		Balancer:     &kafkago.LeastBytes{},
+		WriteTimeout: cfg.WriteTimeout,
+		RequiredAcks: kafkago.RequireAll,
+		Async:        false,
+		ErrorLogger: kafkago.LoggerFunc(func(msg string, args ...interface{}) {
+			logger.Error("kafka blacklist writer error",
+				slog.String("detail", fmt.Sprintf(msg, args...)),
+			)
+		}),
+	}
+
 	p := &Producer{
-		writer:   w,
-		ch:       make(chan AccessLogEvent, cfg.ChannelSize),
-		done:     make(chan struct{}),
-		authCh:   make(chan AuthSessionEvent, 512), // auth logins are low-frequency
-		authDone: make(chan struct{}),
-		logger:   logger,
+		writer:        w,
+		blacklistWriter: blacklistW,
+		ch:            make(chan AccessLogEvent, cfg.ChannelSize),
+		done:          make(chan struct{}),
+		authCh:        make(chan AuthSessionEvent, 512), // auth logins are low-frequency
+		authDone:      make(chan struct{}),
+		blacklistCh:   make(chan BlacklistSyncEvent, 128), // admin blocks are very low-frequency
+		blacklistDone: make(chan struct{}),
+		logger:        logger,
 	}
 	go p.runWorker()
 	go p.runAuthWorker()
+	go p.runBlacklistWorker()
 	return p, nil
 }
 
@@ -148,6 +192,18 @@ func (p *Producer) PublishAuthSession(event AuthSessionEvent) {
 		// (access logs). Dropped auth-session events are lost audit records and
 		// need a distinct alert threshold from high-frequency HTTP log drops.
 		metrics.KafkaAuthSessionsDropped.Inc()
+	}
+}
+
+// PublishBlacklistSync enqueues a BlacklistSyncEvent for delivery to the
+// blacklist-sync topic. Non-blocking: dropped if the channel is full.
+// Callers must not call PublishBlacklistSync after Close.
+func (p *Producer) PublishBlacklistSync(event BlacklistSyncEvent) {
+	select {
+	case p.blacklistCh <- event:
+	default:
+		p.blacklistDropped.Add(1)
+		metrics.KafkaEventsDropped.Inc()
 	}
 }
 
@@ -175,14 +231,15 @@ func (p *Producer) Close(ctx context.Context) error {
 	// M-1: capture counts before closing so the timeout log is not racing the drain.
 	remaining := len(p.ch)
 	authRemaining := len(p.authCh)
-	// H-2: sync.Once ensures both channels are closed exactly once.
+	blacklistRemaining := len(p.blacklistCh)
+	// H-2: sync.Once ensures all channels are closed exactly once.
 	p.closeOnce.Do(func() {
 		close(p.ch)
 		close(p.authCh)
+		close(p.blacklistCh)
 	})
-	// Wait for both workers using a single helper so the same ctx deadline covers
-	// both. A sequential loop would let the first worker consume the full deadline,
-	// leaving zero budget for the second — potentially racing writer.Close.
+	// Wait for all three workers using the same ctx deadline so no single worker
+	// can consume the full budget, leaving others racing writer.Close.
 	waitDone := func(ch chan struct{}) bool {
 		select {
 		case <-ch:
@@ -191,17 +248,23 @@ func (p *Producer) Close(ctx context.Context) error {
 			return false
 		}
 	}
-	// Evaluate both independently — short-circuit (||) would skip the second
-	// wait if the first times out, leaving runAuthWorker racing writer.Close.
+	// Evaluate all three independently to avoid short-circuit skipping any worker.
 	d1 := waitDone(p.done)
 	d2 := waitDone(p.authDone)
-	if !d1 || !d2 {
+	d3 := waitDone(p.blacklistDone)
+	if !d1 || !d2 || !d3 {
 		p.logger.Warn("Kafka producer close timed out; events may be lost",
 			slog.Int("remaining", remaining),
 			slog.Int("authRemaining", authRemaining),
+			slog.Int("blacklistRemaining", blacklistRemaining),
 		)
 	}
-	return p.writer.Close()
+	blacklistCloseErr := p.blacklistWriter.Close()
+	writerCloseErr := p.writer.Close()
+	if blacklistCloseErr != nil {
+		return blacklistCloseErr
+	}
+	return writerCloseErr
 }
 
 // runWorker is the single background goroutine owned by Producer.
@@ -261,6 +324,33 @@ func (p *Producer) writeMessage(payload []byte) error {
 	return p.writer.WriteMessages(ctx, kafkago.Message{Value: payload})
 }
 
+// runBlacklistWorker is the background goroutine for BlacklistSyncEvent delivery.
+// It writes to the blacklist-sync topic via the dedicated blacklistWriter.
+func (p *Producer) runBlacklistWorker() {
+	defer close(p.blacklistDone)
+	for event := range p.blacklistCh {
+		payload, err := json.Marshal(event)
+		if err != nil {
+			p.logger.Error("marshal error (dropping blacklist-sync event)",
+				slog.String("targetType", event.TargetType),
+				slog.String("eventType", event.EventType),
+				slog.Any("error", err),
+			)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		writeErr := p.blacklistWriter.WriteMessages(ctx, kafkago.Message{Value: payload})
+		cancel()
+		if writeErr != nil {
+			p.logger.Error("write error (dropping blacklist-sync event)",
+				slog.String("targetType", event.TargetType),
+				slog.String("eventType", event.EventType),
+				slog.Any("error", writeErr),
+			)
+		}
+	}
+}
+
 // ── NoopPublisher ─────────────────────────────────────────────────────────────
 
 // NoopPublisher satisfies EventPublisher with no-op implementations.
@@ -268,6 +358,7 @@ func (p *Producer) writeMessage(payload []byte) error {
 // the service start in degraded state without access logging.
 type NoopPublisher struct{}
 
-func (n *NoopPublisher) Publish(_ AccessLogEvent)             {}
-func (n *NoopPublisher) PublishAuthSession(_ AuthSessionEvent) {}
-func (n *NoopPublisher) Close(_ context.Context) error        { return nil }
+func (n *NoopPublisher) Publish(_ AccessLogEvent)                {}
+func (n *NoopPublisher) PublishAuthSession(_ AuthSessionEvent)   {}
+func (n *NoopPublisher) PublishBlacklistSync(_ BlacklistSyncEvent) {}
+func (n *NoopPublisher) Close(_ context.Context) error           { return nil }

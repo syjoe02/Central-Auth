@@ -25,6 +25,7 @@ func TestShouldStartConsumer_TrueForRealPublisher(t *testing.T) {
 // stubPublisher is a minimal EventPublisher that is not a *NoopPublisher.
 type stubPublisher struct{}
 
-func (s *stubPublisher) Publish(_ kafka.AccessLogEvent)             {}
-func (s *stubPublisher) PublishAuthSession(_ kafka.AuthSessionEvent) {}
-func (s *stubPublisher) Close(_ context.Context) error               { return nil }
+func (s *stubPublisher) Publish(_ kafka.AccessLogEvent)                {}
+func (s *stubPublisher) PublishAuthSession(_ kafka.AuthSessionEvent)   {}
+func (s *stubPublisher) PublishBlacklistSync(_ kafka.BlacklistSyncEvent) {}
+func (s *stubPublisher) Close(_ context.Context) error                  { return nil }
