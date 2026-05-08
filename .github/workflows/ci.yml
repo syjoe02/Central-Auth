@@ -39,6 +39,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+
+      - name: Install protoc plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+
+      - name: Generate proto
+        run: buf generate
+
       - name: Verify module graph
         run: go mod verify
 
@@ -101,6 +114,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+
+      - name: Install protoc plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+
+      - name: Generate proto
+        run: buf generate
+
       - name: Wait for Redis
         run: |
           for i in $(seq 1 10); do
@@ -149,6 +175,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+
+      - name: Install protoc plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+
+      - name: Generate proto
+        run: buf generate
 
       - name: Run contract tests
         run: >

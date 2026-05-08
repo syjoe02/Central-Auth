@@ -1,0 +1,14 @@
+version: v2
+
+modules:
+  - path: proto
+
+lint:
+  use:
+    - STANDARD
+  except:
+    - COMMENT_FIELD
+
+breaking:
+  use:
+    - FILE
