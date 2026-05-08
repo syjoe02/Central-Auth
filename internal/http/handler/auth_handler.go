@@ -40,69 +40,6 @@ func isTokenError(err error) bool {
 	return errors.Is(err, service.ErrInvalidToken)
 }
 
-// Login handles POST /auth/login.
-// Accepts two forms:
-//   - Email+password: {"email","password","device_id","remember_me"} — authenticates via Kratos
-//   - Pre-authenticated: {"user_id","device_id","remember_me"} — issues tokens directly (legacy)
-func (h *AuthHandler) Login(c *gin.Context) {
-	var req model.LoginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	userAgent := c.GetHeader("User-Agent")
-	ip := c.ClientIP()
-	var uaPtr, ipPtr *string
-	if userAgent != "" {
-		uaPtr = &userAgent
-	}
-	if ip != "" {
-		ipPtr = &ip
-	}
-
-	var access, refresh string
-	var err error
-
-	if req.Email != "" && req.Password != "" {
-		// Email+password path: authenticate via Kratos, then issue Hydra tokens.
-		access, refresh, err = h.authService.LoginWithPassword(
-			c.Request.Context(),
-			req.Email, req.Password, req.DeviceID, req.RememberMe,
-			uaPtr, ipPtr,
-		)
-		if err != nil {
-			if errors.Is(err, service.ErrInvalidCredentials) {
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
-				return
-			}
-			log.Printf("Login error: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
-			return
-		}
-	} else if req.KratosID != "" {
-		// Pre-authenticated path: caller already has a Kratos ID.
-		access, refresh, err = h.authService.Login(
-			c.Request.Context(),
-			req.KratosID, req.DeviceID, req.RememberMe,
-			uaPtr, ipPtr,
-		)
-		if err != nil {
-			log.Printf("Login error: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
-			return
-		}
-	} else {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "provide either email+password or user_id"})
-		return
-	}
-
-	c.JSON(http.StatusOK, model.LoginResponse{
-		AccessToken:  access,
-		RefreshToken: refresh,
-	})
-}
-
 // Logout handles POST /auth/logout.
 // Expects Authorization: Bearer <hydra-refresh-token>.
 func (h *AuthHandler) Logout(c *gin.Context) {
@@ -184,7 +121,7 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 		return
 	}
 
-	kratosID, err := h.authService.Signup(c.Request.Context(), req.Email, req.Password)
+	kratosID, err := h.authService.Signup(c.Request.Context(), req.Email)
 	if err != nil {
 		if errors.Is(err, service.ErrEmailConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})

@@ -255,7 +255,6 @@ func main() {
 	auth.Use(middleware.ServiceAuthMiddleware(serverConfig.ServiceAPIKey))
 	{
 		auth.POST("/signup", authHandler.Signup) // no rate limit — protected by X-Service-Key
-		auth.POST("/login", middleware.RateLimitMiddleware(), authHandler.Login)
 		auth.POST("/refresh", middleware.RateLimitMiddleware(), authHandler.Refresh)
 		auth.POST("/logout", authHandler.Logout)
 		auth.POST("/logout-all", authHandler.LogoutAll)

@@ -28,7 +28,7 @@ var ErrInvalidToken = errors.New("invalid or expired token")
 // ErrEmailConflict is returned by Signup when the email is already registered.
 var ErrEmailConflict = errors.New("email already registered")
 
-// ErrInvalidCredentials is returned by LoginWithPassword when the credentials are wrong.
+// ErrInvalidCredentials is returned by GoogleLogin when no identity with the given email exists.
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
 // ErrTokenRevoked is returned by VerifyToken when the token's device or user
@@ -49,10 +49,6 @@ type AuthServiceI interface {
 	// The caller (e.g. Django) has already verified the user's credentials.
 	Login(ctx context.Context, kratosID, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
 
-	// LoginWithPassword authenticates the user against Kratos, then issues Hydra tokens.
-	// This is the primary path used by the Django integration.
-	LoginWithPassword(ctx context.Context, email, password, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
-
 	// Logout revokes the session identified by the given Hydra refresh token.
 	Logout(ctx context.Context, refreshToken string) error
 
@@ -66,10 +62,10 @@ type AuthServiceI interface {
 	// Fail-closed: any error (invalid signature, expired, JWKS unavailable) returns a non-nil error.
 	VerifyToken(ctx context.Context, accessToken string) (*VerifyResult, error)
 
-	// Signup creates a new Kratos identity with the given email and password.
-	// Returns the new Kratos identity UUID. Returns ErrEmailConflict if the
-	// email is already registered.
-	Signup(ctx context.Context, email, password string) (kratosID string, err error)
+	// Signup creates a new Kratos identity for the given email (no password credential).
+	// The identity is linked to Google OIDC on the user's first Google login.
+	// Returns the new Kratos identity UUID. Returns ErrEmailConflict if the email is already registered.
+	Signup(ctx context.Context, email string) (kratosID string, err error)
 
 	// GoogleLogin looks up the Kratos identity by email (already verified via OIDC)
 	// and issues Hydra tokens. Returns ErrInvalidCredentials if no identity exists.
@@ -396,36 +392,14 @@ func derefStr(s *string) string {
 	return *s
 }
 
-// LoginWithPassword authenticates the user via Kratos self-service, then issues Hydra tokens.
-// This is the primary path for the Django integration (email+password login).
-func (s *OryAuthService) LoginWithPassword(
-	ctx context.Context,
-	email, password, deviceID string,
-	rememberMe bool,
-	userAgent, ip *string,
-) (string, string, error) {
-	if s.kratosClient == nil {
-		return "", "", fmt.Errorf("login_with_password: Kratos client not configured")
-	}
-	kratosID, err := s.kratosClient.AuthenticatePassword(ctx, email, password)
-	if err != nil {
-		if errors.Is(err, kratos.ErrInvalidCredentials) {
-			return "", "", ErrInvalidCredentials
-		}
-		log.Printf("[ERROR] Kratos AuthenticatePassword failed: %v", err)
-		return "", "", fmt.Errorf("login_with_password: authenticate: %w", err)
-	}
-	return s.Login(ctx, kratosID, deviceID, rememberMe, userAgent, ip)
-}
-
-// Signup creates a new Kratos identity with the given email and password.
-// Returns the Kratos identity UUID on success. Returns ErrEmailConflict if the
-// email is already registered.
-func (s *OryAuthService) Signup(ctx context.Context, email, password string) (string, error) {
+// Signup creates a new Kratos identity for the given email with no password credential.
+// The identity is linked to Google OIDC automatically on the user's first Google login.
+// Returns the Kratos identity UUID on success. Returns ErrEmailConflict if the email is already registered.
+func (s *OryAuthService) Signup(ctx context.Context, email string) (string, error) {
 	if s.kratosClient == nil {
 		return "", fmt.Errorf("signup: Kratos client not configured")
 	}
-	id, err := s.kratosClient.CreateIdentity(ctx, email, password)
+	id, err := s.kratosClient.CreateIdentity(ctx, email)
 	if err != nil {
 		if errors.Is(err, kratos.ErrEmailConflict) {
 			return "", ErrEmailConflict

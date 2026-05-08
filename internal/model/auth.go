@@ -1,19 +1,6 @@
 package model
 
-// LoginRequest is the body for POST /auth/login.
-// Accepts either email+password credentials (delegated to Kratos for verification)
-// or a pre-authenticated KratosID passed directly as user_id.
-type LoginRequest struct {
-	// Email+password path (used by Django integration)
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	// Pre-authenticated Kratos ID path (legacy / internal use)
-	KratosID   string `json:"user_id"`
-	DeviceID   string `json:"device_id" binding:"required"`
-	RememberMe bool   `json:"remember_me"`
-}
-
-// LoginResponse is the successful response from POST /auth/login and POST /auth/refresh.
+// LoginResponse is the successful response from POST /auth/google/login and POST /auth/refresh.
 type LoginResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
@@ -39,9 +26,10 @@ type WhoAmIResponse struct {
 }
 
 // SignupRequest is the body for POST /auth/signup.
+// Only email is required; no password credential is created on the Kratos identity.
+// Google OIDC is linked automatically on the user's first Google login.
 type SignupRequest struct {
-	Email    string `json:"email"    binding:"required,email"`
-	Password string `json:"password" binding:"required"`
+	Email string `json:"email" binding:"required,email"`
 }
 
 // SignupResponse is the successful response from POST /auth/signup.
