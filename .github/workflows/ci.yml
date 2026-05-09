@@ -79,12 +79,13 @@ jobs:
 
   # ──────────────────────────────────────────────────────────────────────────
   # ② Integration Tests
-  # Verifies that the real Redis repository and Kratos HTTP client work
-  # correctly against live service containers.
+  # Verifies that the real Redis and PostgreSQL repositories work correctly
+  # against live service containers.
   #
-  # Redis:  GHA service container (redis:7-alpine), accessible at localhost:6379
-  # Kratos: mock httptest.Server started inside the test process itself —
-  #         no extra container needed.
+  # Redis:    GHA service container (redis:7-alpine), accessible at localhost:6379
+  # Postgres: GHA service container (postgres:16-alpine), accessible at localhost:5432
+  # Kratos:   mock httptest.Server started inside the test process itself —
+  #           no extra container needed.
   # ──────────────────────────────────────────────────────────────────────────
   integration-test:
     name: "2. Integration Tests"
@@ -102,8 +103,23 @@ jobs:
           --health-timeout 3s
           --health-retries 5
 
+      postgres:
+        image: postgres:16-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd "pg_isready -U testuser"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     env:
       REDIS_ADDR: localhost:6379
+      TEST_DB_URL: postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable
 
     steps:
       - uses: actions/checkout@v4
@@ -132,6 +148,13 @@ jobs:
           for i in $(seq 1 10); do
             redis-cli -h localhost -p 6379 ping && break
             echo "Waiting for Redis… ($i/10)"
+            sleep 2
+          done
+
+      - name: Wait for Postgres
+        run: |
+          until pg_isready -h localhost -p 5432 -U testuser; do
+            echo "Waiting for Postgres to be ready..."
             sleep 2
           done
 

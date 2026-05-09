@@ -99,12 +99,17 @@ func (r *RedisRepository) SaveLogin(ctx context.Context, kratosID, deviceID, hyd
 	).Err()
 }
 
+// ErrDeviceTokenNotFound is returned by GetDeviceRefreshToken when no token
+// exists for the given kratosID+deviceID pair (device never logged in, or logged out).
+var ErrDeviceTokenNotFound = errors.New("device refresh token not found")
+
 // GetDeviceRefreshToken retrieves the stored Hydra refresh token for a specific device.
 // Used by the Logout flow to revoke the exact refresh token without an extra introspection call.
+// Returns ErrDeviceTokenNotFound when the key is absent (device logged out or never logged in).
 func (r *RedisRepository) GetDeviceRefreshToken(ctx context.Context, kratosID, deviceID string) (string, error) {
 	token, err := r.client.Get(ctx, refreshKey(kratosID, deviceID)).Result()
 	if errors.Is(err, redis.Nil) {
-		return "", nil
+		return "", ErrDeviceTokenNotFound
 	}
 	return token, err
 }
