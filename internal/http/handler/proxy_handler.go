@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -71,15 +73,20 @@ func NewProxyHandler(djangoURL string, dialTimeout time.Duration, hydraClient hy
 
 // Handle is the Gin handler for all /api/* routes.
 // Authenticated routes: validate Hydra JWT locally (cached JWKS, zero network
-// calls on hot path) then inject Authorization: Bearer + X-User-ID before
-// forwarding to Django.
+// calls on hot path) then inject trusted headers before forwarding to Django/Kotlin.
 // Auth-free routes (/api/auth/*): forwarded as-is.
 func (h *ProxyHandler) Handle(c *gin.Context) {
 	path := c.Request.URL.Path
 
-	// Strip X-User-ID unconditionally so callers cannot spoof the identity header
-	// on auth-free paths. It is only re-added after successful JWT validation below.
+	// Strip spoof-able identity headers unconditionally.
+	// They are only re-added below after successful JWT validation.
 	c.Request.Header.Del("X-User-ID")
+	c.Request.Header.Del("X-Device-ID")
+
+	// Propagate or generate a Correlation-ID for distributed tracing.
+	if c.Request.Header.Get("X-Correlation-ID") == "" {
+		c.Request.Header.Set("X-Correlation-ID", newCorrelationID())
+	}
 
 	if !isAuthFree(path) {
 		token := extractBearerToken(c.Request)
@@ -94,14 +101,25 @@ func (h *ProxyHandler) Handle(c *gin.Context) {
 			return
 		}
 
-		// Normalise to header so Django's JWKS middleware reads it from one place.
+		// Normalise to header so downstream JWKS middleware reads it from one place.
 		c.Request.Header.Set("Authorization", "Bearer "+token)
-		// Convenience header — Django's OryIdentityProxy uses JWKS for ground truth,
-		// but X-User-ID lets views read kratosID without decoding the JWT.
+		// Convenience headers — downstream services can read these without re-decoding the JWT.
 		c.Request.Header.Set("X-User-ID", claims.Subject)
+		if deviceID := claims.DeviceID(); deviceID != "" {
+			c.Request.Header.Set("X-Device-ID", deviceID)
+		}
 	}
 
 	h.proxy.ServeHTTP(c.Writer, c.Request)
+}
+
+// newCorrelationID generates a 16-byte random hex string for request tracing.
+func newCorrelationID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "fallback-correlation-id"
+	}
+	return hex.EncodeToString(b)
 }
 
 // isAuthFree returns true when the path should be forwarded without token validation.

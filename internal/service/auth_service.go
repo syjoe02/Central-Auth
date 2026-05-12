@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	RefreshTTLShort = time.Hour * 24 * 7  // 7 days (default)
-	RefreshTTLLong  = time.Hour * 24 * 30 // 30 days (remember_me)
+	RefreshTTLShort    = time.Hour * 24 * 7  // 7 days (default)
+	RefreshTTLLong     = time.Hour * 24 * 30 // 30 days (remember_me)
+	accessTokenTTL     = time.Minute * 15    // must match Hydra TTL_ACCESS_TOKEN
+	blacklistSyncExtra = time.Minute * 5     // grace buffer added on top of accessTokenTTL
 )
 
 // ErrInvalidToken is returned by the service for token errors that should map
@@ -228,6 +230,19 @@ func (s *OryAuthService) Logout(ctx context.Context, refreshToken string) error 
 		}
 	}
 
+	// Fan-out revocation to downstream services (Kotlin, Django) via Kafka.
+	// ExpiresAt = access token TTL + buffer; downstream services use this to set
+	// their Redis TTL instead of a fixed 60s, avoiding premature eviction.
+	expiresAt := time.Now().UTC().Add(accessTokenTTL + blacklistSyncExtra)
+	s.publisher.PublishBlacklistSync(kafkapkg.BlacklistSyncEvent{
+		EventType:   "blacklist.sync",
+		TargetType:  "DEVICE",
+		TargetValue: kratosID + ":" + deviceID,
+		Reason:      "user logout",
+		ExpiresAt:   expiresAt.Format(time.RFC3339Nano),
+		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
+	})
+
 	if err := s.redisRepo.LogoutDevice(ctx, kratosID, deviceID); err != nil {
 		log.Printf("[WARN] [%s] logout: Redis cleanup failed (non-fatal): %v", rid, err)
 	}
@@ -282,6 +297,16 @@ func (s *OryAuthService) LogoutAll(ctx context.Context, refreshToken string) err
 			log.Printf("[WARN] [%s] logout-all: blacklist degraded (ErrRedisUnavailable), user key written to PG fallback kratosID=%s", rid, maskID(kratosID))
 		}
 	}
+
+	expiresAt := time.Now().UTC().Add(accessTokenTTL + blacklistSyncExtra)
+	s.publisher.PublishBlacklistSync(kafkapkg.BlacklistSyncEvent{
+		EventType:   "blacklist.sync",
+		TargetType:  "USER",
+		TargetValue: kratosID,
+		Reason:      "user logout-all",
+		ExpiresAt:   expiresAt.Format(time.RFC3339Nano),
+		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
+	})
 
 	if err := s.redisRepo.LogoutAll(ctx, kratosID); err != nil {
 		log.Printf("[WARN] [%s] logout-all: Redis cleanup failed (non-fatal): %v", rid, err)

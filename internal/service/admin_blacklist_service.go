@@ -10,6 +10,8 @@ import (
 	"central-auth/internal/repository"
 )
 
+const adminBlockTTL = time.Hour * 24 * 30 // 30 days — admin blocks are long-lived; downstream Redis TTL must exceed any active token window
+
 // AdminBlacklistService manages global blocks for users, JTIs, and service keys.
 //
 // On every Block call it:
@@ -60,6 +62,7 @@ func (s *AdminBlacklistService) Block(ctx context.Context, targetType repository
 		TargetType:  string(targetType),
 		TargetValue: targetValue,
 		Reason:      reason,
+		ExpiresAt:   time.Now().UTC().Add(adminBlockTTL).Format(time.RFC3339Nano),
 		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
 	})
 

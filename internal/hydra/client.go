@@ -72,10 +72,62 @@ type AccessTokenClaims struct {
 
 // DeviceID extracts device_id from the ext map.
 func (c *AccessTokenClaims) DeviceID() string {
+	return c.extString("device_id")
+}
+
+// Roles extracts the roles slice from the ext map.
+func (c *AccessTokenClaims) Roles() []string {
+	if c.Ext == nil {
+		return nil
+	}
+	raw, ok := c.Ext["roles"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// Permissions extracts the permissions slice from the ext map.
+func (c *AccessTokenClaims) Permissions() []string {
+	if c.Ext == nil {
+		return nil
+	}
+	raw, ok := c.Ext["permissions"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func (c *AccessTokenClaims) extString(key string) string {
 	if c.Ext == nil {
 		return ""
 	}
-	if v, ok := c.Ext["device_id"].(string); ok {
+	if v, ok := c.Ext[key].(string); ok {
 		return v
 	}
 	return ""
@@ -344,8 +396,17 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 		"remember":                    rememberMe,
 		"remember_for":                rememberFor,
 		"session": map[string]interface{}{
-			"access_token": map[string]string{"device_id": deviceID},
-			"id_token":     map[string]string{"device_id": deviceID},
+			// ext claims are embedded in the JWT by Hydra.
+			// roles / permissions default to ["user"] / [] until the identity
+			// management layer (Kratos metadata or a roles DB) provides real values.
+			"access_token": map[string]interface{}{
+				"device_id":   deviceID,
+				"roles":       []string{"user"},
+				"permissions": []string{},
+			},
+			"id_token": map[string]interface{}{
+				"device_id": deviceID,
+			},
 		},
 	}
 	redirectTo2, err := c.adminAccept(ctx, "/admin/oauth2/auth/requests/consent/accept?consent_challenge="+consentChallenge, consentAcceptBody)

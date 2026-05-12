@@ -51,17 +51,26 @@ type AuthSessionEvent struct {
 	Timestamp string `json:"timestamp"` // RFC3339Nano, UTC
 }
 
-// BlacklistSyncEvent is published to the blacklist-sync topic when an admin
-// registers or removes a global block (by KratosID, JTI, or service key).
-// All Django instances consume this topic to maintain their local L1 cache.
+// BlacklistSyncEvent is published to the blacklist-sync topic when a session is
+// revoked or an admin registers/removes a global block.
+// All downstream services (Kotlin, Django) consume this topic to maintain their
+// local Redis L1 cache.
 //
-//   - event_type "blacklist.sync"    → add the target to the L1 cache (TTL 60 s)
+//   - event_type "blacklist.sync"    → add the target to the L1 cache (TTL = ExpiresAt - now)
 //   - event_type "blacklist.unblock" → evict the target from the L1 cache
+//
+// TargetType values:
+//
+//	"USER"        → block all tokens for the given KratosID
+//	"DEVICE"      → block a specific device session (TargetValue = "{kratosID}:{deviceID}")
+//	"JTI"         → block a specific access token by its jti
+//	"SERVICE_KEY" → block a service-to-service key
 type BlacklistSyncEvent struct {
 	EventType   string `json:"event_type"`        // "blacklist.sync" or "blacklist.unblock"
-	TargetType  string `json:"target_type"`        // "USER", "JTI", "SERVICE_KEY"
+	TargetType  string `json:"target_type"`        // "USER", "DEVICE", "JTI", "SERVICE_KEY"
 	TargetValue string `json:"target_value"`       // the blocked/unblocked value
 	Reason      string `json:"reason,omitempty"`   // optional human-readable reason
+	ExpiresAt   string `json:"expires_at"`         // RFC3339Nano UTC; consumers set Redis TTL = ExpiresAt - now
 	Timestamp   string `json:"timestamp"`          // RFC3339Nano, UTC
 }
 
