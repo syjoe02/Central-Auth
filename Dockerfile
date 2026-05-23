@@ -8,7 +8,7 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o central-auth ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -o central-auth ./cmd/server
 
 FROM alpine:3.19
 
