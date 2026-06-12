@@ -7,7 +7,7 @@ type LoginResponse struct {
 }
 
 // BFFLoginRequest is the body for POST /bff/login.
-// The json tag "user_id" is kept consistent with LoginRequest for Django compatibility.
+// The json tag "user_id" is the established API contract for this endpoint.
 type BFFLoginRequest struct {
 	KratosID   string `json:"user_id"   binding:"required"`
 	DeviceID   string `json:"device_id" binding:"required"`

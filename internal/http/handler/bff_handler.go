@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"log"
 	"net/http"
 	"time"
 
@@ -28,8 +29,7 @@ func NewBFFHandler(bffService service.BFFServiceI, cfg config.BFFConfig) *BFFHan
 }
 
 // Login handles POST /bff/login.
-// Accepts the same JSON body shape as the existing /auth/login so that Django
-// can drive BFF logins during the migration period.
+// Accepts JSON body: {"user_id","device_id","remember_me"}.
 // On success: sets __session cookie and returns {"status":"authenticated"}.
 // Hydra tokens are NEVER included in the response body.
 func (h *BFFHandler) Login(c *gin.Context) {
@@ -44,7 +44,8 @@ func (h *BFFHandler) Login(c *gin.Context) {
 
 	sessionID, err := h.bffService.Login(c.Request.Context(), req.KratosID, req.DeviceID, req.RememberMe, &ua, &ip)
 	if err != nil {
-		// Do not leak internal error details to the browser.
+		// Log the internal error for diagnostics, but do not expose details to the browser.
+		log.Printf("[BFF] Login error kratosID=%s: %v", req.KratosID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "login failed"})
 		return
 	}

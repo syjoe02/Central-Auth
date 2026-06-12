@@ -1,6 +1,6 @@
 -- Global admin blacklist for USER (kratos_id), JTI, and SERVICE_KEY targets.
 -- Distinct from blacklisted_sessions (BFF session revocation); this table drives
--- fan-out to all Django instances via the blacklist-sync Kafka topic.
+-- fan-out to downstream services via the blacklist-sync Kafka topic.
 CREATE TABLE blacklists (
     id           BIGSERIAL PRIMARY KEY,
     target_type  VARCHAR(32)              NOT NULL,

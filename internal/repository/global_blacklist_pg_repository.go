@@ -27,7 +27,7 @@ type GlobalBlacklistEntry struct {
 
 // GlobalBlacklistRepository manages the admin-driven blacklists table.
 // Unlike blacklisted_sessions (BFF session revocation by JTI), this table
-// stores durable identity-level blocks that fan-out to all Django instances
+// stores durable identity-level blocks that fan-out to downstream services
 // via the blacklist-sync Kafka topic.
 type GlobalBlacklistRepository interface {
 	// Add upserts a global block entry.
@@ -82,7 +82,7 @@ func (r *PostgresGlobalBlacklistRepository) IsBlacklisted(ctx context.Context, t
 }
 
 // ListAll returns all entries ordered by creation time.
-// Used on service start to warm up Django L1 caches via Kafka replay.
+// Used on service start to warm up downstream L1 caches via Kafka replay.
 func (r *PostgresGlobalBlacklistRepository) ListAll(ctx context.Context) ([]GlobalBlacklistEntry, error) {
 	ctx, cancel := context.WithTimeout(ctx, dbQueryTimeout)
 	defer cancel()

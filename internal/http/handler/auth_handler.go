@@ -139,7 +139,7 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 }
 
 // GoogleLogin handles POST /auth/google/login.
-// Called by Django's CentralAuthAdapter after a successful Kratos Google OIDC flow.
+// Called by a trusted S2S client (X-Service-Key required) after a successful Kratos Google OIDC flow.
 // The email has already been verified by Kratos; we look up the identity and issue tokens.
 //
 // Request body: {"email","device_id","remember_me"}

@@ -30,12 +30,14 @@ const (
 // token injection attacks).
 //
 // Format: <32-hex-random>-<64-hex-HMAC(secret, sessionID+random)>
-func CSRFMiddleware(csrfSecret string) gin.HandlerFunc {
+func CSRFMiddleware(csrfSecret string, cookieSecure bool) gin.HandlerFunc {
 	secretKey := []byte(csrfSecret)
 
 	return func(c *gin.Context) {
+		sessionID := sessionIDFromContext(c)
+
+		// Validate CSRF token for state-changing requests before the handler runs.
 		if isStateChangingMethod(c.Request.Method) {
-			sessionID := sessionIDFromContext(c)
 			headerToken := c.GetHeader(csrfHeaderName)
 			cookieToken, _ := c.Cookie(csrfCookieName)
 
@@ -51,25 +53,25 @@ func CSRFMiddleware(csrfSecret string) gin.HandlerFunc {
 			}
 		}
 
-		c.Next()
-
-		// Rotate CSRF token on every response to limit reuse window.
-		sessionID := sessionIDFromContext(c)
+		// Issue a fresh CSRF token BEFORE calling c.Next() so the Set-Cookie
+		// header is included before Gin commits the response headers via c.JSON().
+		// Setting cookies after c.Next() is too late — headers are already sent.
 		token, err := newCSRFToken(secretKey, sessionID)
 		if err != nil {
-			// crypto/rand failure is catastrophic; log and skip cookie rotation.
-			// The existing cookie (if any) remains valid for this session.
 			log.Printf("[ERROR] CSRF: failed to generate token: %v", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
 		http.SetCookie(c.Writer, &http.Cookie{
 			Name:     csrfCookieName,
 			Value:    token,
 			Path:     "/",
-			Secure:   true,
+			Secure:   cookieSecure,
 			HttpOnly: false, // Must be readable by JS to set the request header.
 			SameSite: http.SameSiteStrictMode,
 		})
+
+		c.Next()
 	}
 }
 

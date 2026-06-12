@@ -42,13 +42,13 @@ func LoadOryConfig() OryConfig {
 	}
 
 	// HYDRA_JWT_AUDIENCE is the aud claim value placed in issued access tokens
-	// and validated on every /auth/verify call. Set this to whatever the Django
-	// backend expects in the aud claim. Defaults to HYDRA_CLIENT_ID for
-	// backward compatibility.
+	// and validated on every /auth/verify call. Must match the aud value that
+	// backendKotlin's Spring Security resource server validates. Defaults to
+	// HYDRA_CLIENT_ID for backward compatibility.
 	jwtAudience := os.Getenv("HYDRA_JWT_AUDIENCE")
 	if jwtAudience == "" {
 		jwtAudience = required["HYDRA_CLIENT_ID"]
-		log.Println("[WARN] HYDRA_JWT_AUDIENCE not set; defaulting to HYDRA_CLIENT_ID — verify this matches what the Django backend expects in the aud claim")
+		log.Println("[WARN] HYDRA_JWT_AUDIENCE not set; defaulting to HYDRA_CLIENT_ID — verify this matches the aud claim expected by backendKotlin")
 	}
 
 	return OryConfig{

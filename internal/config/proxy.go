@@ -6,21 +6,27 @@ import (
 	"time"
 )
 
-// ProxyConfig holds configuration for the Django API reverse proxy.
+// ProxyConfig holds configuration for the Kotlin API reverse proxy.
 type ProxyConfig struct {
-	DjangoURL   string
-	DialTimeout time.Duration
+	KotlinURL        string
+	DialTimeout      time.Duration
+	KotlinServiceKey string // sent as X-Service-Key on every proxied request
 }
 
-// LoadProxyConfig reads DJANGO_URL from the environment.
-// Fails fast if the variable is absent so misconfiguration is caught at startup.
+// LoadProxyConfig reads KOTLIN_URL and KOTLIN_SERVICE_KEY from the environment.
+// Fails fast if either variable is absent so misconfiguration is caught at startup.
 func LoadProxyConfig() (ProxyConfig, error) {
-	u := os.Getenv("DJANGO_URL")
+	u := os.Getenv("KOTLIN_URL")
 	if u == "" {
-		return ProxyConfig{}, fmt.Errorf("DJANGO_URL is required")
+		return ProxyConfig{}, fmt.Errorf("KOTLIN_URL is required")
+	}
+	key := os.Getenv("KOTLIN_SERVICE_KEY")
+	if key == "" {
+		return ProxyConfig{}, fmt.Errorf("KOTLIN_SERVICE_KEY is required")
 	}
 	return ProxyConfig{
-		DjangoURL:   u,
-		DialTimeout: 3 * time.Second,
+		KotlinURL:        u,
+		DialTimeout:      3 * time.Second,
+		KotlinServiceKey: key,
 	}, nil
 }

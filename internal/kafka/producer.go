@@ -53,7 +53,7 @@ type AuthSessionEvent struct {
 
 // BlacklistSyncEvent is published to the blacklist-sync topic when a session is
 // revoked or an admin registers/removes a global block.
-// All downstream services (Kotlin, Django) consume this topic to maintain their
+// Downstream services (backendKotlin) consume this topic to maintain their
 // local Redis L1 cache.
 //
 //   - event_type "blacklist.sync"    → add the target to the L1 cache (TTL = ExpiresAt - now)
@@ -80,7 +80,7 @@ type EventPublisher interface {
 	Publish(event AccessLogEvent)
 	PublishAuthSession(event AuthSessionEvent)
 	// PublishBlacklistSync fans out a global block/unblock event to the
-	// blacklist-sync topic so all Django instances update their L1 cache.
+	// blacklist-sync topic so downstream services update their L1 cache.
 	PublishBlacklistSync(event BlacklistSyncEvent)
 	Close(ctx context.Context) error
 }

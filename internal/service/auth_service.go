@@ -48,7 +48,7 @@ type VerifyResult struct {
 // It is satisfied by both OryAuthService (real) and InstrumentedAuthService (metrics wrapper).
 type AuthServiceI interface {
 	// Login issues Hydra tokens for a pre-authenticated Kratos identity.
-	// The caller (e.g. Django) has already verified the user's credentials.
+	// The caller has already verified the user's credentials via Kratos.
 	Login(ctx context.Context, kratosID, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
 
 	// Logout revokes the session identified by the given Hydra refresh token.
@@ -230,7 +230,7 @@ func (s *OryAuthService) Logout(ctx context.Context, refreshToken string) error 
 		}
 	}
 
-	// Fan-out revocation to downstream services (Kotlin, Django) via Kafka.
+	// Fan-out revocation to downstream services (backendKotlin) via Kafka.
 	// ExpiresAt = access token TTL + buffer; downstream services use this to set
 	// their Redis TTL instead of a fixed 60s, avoiding premature eviction.
 	expiresAt := time.Now().UTC().Add(accessTokenTTL + blacklistSyncExtra)

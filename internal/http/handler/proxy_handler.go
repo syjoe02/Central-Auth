@@ -13,31 +13,34 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-
-	"central-auth/internal/hydra"
 )
 
-// authFreePrefixes are proxied to Django without requiring a valid access token.
-// These paths are handled by Django's own auth middleware (login, signup, refresh)
-// or are public endpoints.
+// authFreePrefixes are proxied to backendKotlin without an authenticated BFF
+// session being required. These paths are public or handled by backendKotlin's
+// own logic (e.g. signup).
 var authFreePrefixes = []string{
 	"/api/auth/",
 }
 
-// ProxyHandler validates the caller's Hydra access token then reverse-proxies
-// the request to the Django backend. On authenticated routes it injects an
-// Authorization: Bearer header so Django's JWKS middleware can re-validate
-// without touching a cookie.
+// ProxyHandler validates the BFF session context set by BFFAPIBridgeMiddleware
+// and reverse-proxies the request to the Kotlin backend. It injects a service
+// key so BackendKotlin can trust that the request originated from Central-auth.
 type ProxyHandler struct {
-	proxy       *httputil.ReverseProxy
-	hydraClient hydra.ClientI
+	proxy      *httputil.ReverseProxy
+	serviceKey string
 }
 
-// NewProxyHandler constructs a ProxyHandler that forwards traffic to djangoURL.
-func NewProxyHandler(djangoURL string, dialTimeout time.Duration, hydraClient hydra.ClientI) (*ProxyHandler, error) {
-	target, err := url.Parse(djangoURL)
+// NewProxyHandler constructs a ProxyHandler that forwards traffic to kotlinURL.
+// serviceKey is sent as X-Service-Key on every proxied request so BackendKotlin
+// can verify the request originated from this trusted BFF.
+func NewProxyHandler(kotlinURL string, dialTimeout time.Duration, serviceKey string) (*ProxyHandler, error) {
+	if serviceKey == "" {
+		return nil, fmt.Errorf("proxy: serviceKey must not be empty")
+	}
+
+	target, err := url.Parse(kotlinURL)
 	if err != nil {
-		return nil, fmt.Errorf("proxy: invalid DJANGO_URL %q: %w", djangoURL, err)
+		return nil, fmt.Errorf("proxy: invalid KOTLIN_URL %q: %w", kotlinURL, err)
 	}
 
 	transport := &http.Transport{
@@ -64,49 +67,47 @@ func NewProxyHandler(djangoURL string, dialTimeout time.Duration, hydraClient hy
 	origDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
-		// Rewrite Host so Django's ALLOWED_HOSTS accepts the request.
+		// Rewrite Host to match the backendKotlin service address.
 		req.Host = target.Host
 	}
 
-	return &ProxyHandler{proxy: proxy, hydraClient: hydraClient}, nil
+	return &ProxyHandler{proxy: proxy, serviceKey: serviceKey}, nil
 }
 
 // Handle is the Gin handler for all /api/* routes.
-// Authenticated routes: validate Hydra JWT locally (cached JWKS, zero network
-// calls on hot path) then inject trusted headers before forwarding to Django/Kotlin.
-// Auth-free routes (/api/auth/*): forwarded as-is.
+// Strips all incoming identity/auth headers unconditionally (prevents spoofing),
+// then re-injects X-User-ID and X-Device-ID from the trusted BFF session context
+// set by BFFAPIBridgeMiddleware, and adds X-Service-Key so BackendKotlin can
+// verify this request came from Central-auth.
+// Auth-free routes (/api/auth/*): forwarded without requiring a resolved session.
+// All other routes: require a resolved BFF session (X-User-ID must be set).
 func (h *ProxyHandler) Handle(c *gin.Context) {
 	path := c.Request.URL.Path
 
-	// Strip spoof-able identity headers unconditionally.
-	// They are only re-added below after successful JWT validation.
+	// Strip ALL spoof-able identity/auth headers unconditionally — even on auth-free
+	// paths — so a malicious caller cannot inject trusted headers directly.
 	c.Request.Header.Del("X-User-ID")
 	c.Request.Header.Del("X-Device-ID")
+	c.Request.Header.Del("X-Service-Key")
+	c.Request.Header.Del("Authorization")
 
 	// Propagate or generate a Correlation-ID for distributed tracing.
 	if c.Request.Header.Get("X-Correlation-ID") == "" {
 		c.Request.Header.Set("X-Correlation-ID", newCorrelationID())
 	}
 
+	// Always inject service key so BackendKotlin knows this came from Central-auth.
+	c.Request.Header.Set("X-Service-Key", h.serviceKey)
+
 	if !isAuthFree(path) {
-		token := extractBearerToken(c.Request)
-		if token == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		userID, exists := c.Get("bff.userID")
+		if !exists || userID == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 			return
 		}
-
-		claims, err := h.hydraClient.ValidateAccessToken(c.Request.Context(), token)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
-			return
-		}
-
-		// Normalise to header so downstream JWKS middleware reads it from one place.
-		c.Request.Header.Set("Authorization", "Bearer "+token)
-		// Convenience headers — downstream services can read these without re-decoding the JWT.
-		c.Request.Header.Set("X-User-ID", claims.Subject)
-		if deviceID := claims.DeviceID(); deviceID != "" {
-			c.Request.Header.Set("X-Device-ID", deviceID)
+		c.Request.Header.Set("X-User-ID", userID.(string))
+		if deviceID, ok := c.Get("bff.deviceID"); ok && deviceID != "" {
+			c.Request.Header.Set("X-Device-ID", deviceID.(string))
 		}
 	}
 
@@ -122,7 +123,7 @@ func newCorrelationID() string {
 	return hex.EncodeToString(b)
 }
 
-// isAuthFree returns true when the path should be forwarded without token validation.
+// isAuthFree returns true when the path should be forwarded without a BFF session.
 func isAuthFree(path string) bool {
 	for _, prefix := range authFreePrefixes {
 		if strings.HasPrefix(path, prefix) {
@@ -130,17 +131,4 @@ func isAuthFree(path string) bool {
 		}
 	}
 	return false
-}
-
-// extractBearerToken reads the access token from the Authorization: Bearer header
-// first, then falls back to the access_token httpOnly cookie set by Django's
-// LoginAPIView. Locust's HttpSession propagates cookies automatically.
-func extractBearerToken(r *http.Request) string {
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		return auth[7:]
-	}
-	if cookie, err := r.Cookie("access_token"); err == nil && cookie.Value != "" {
-		return cookie.Value
-	}
-	return ""
 }

@@ -17,12 +17,12 @@ const adminBlockTTL = time.Hour * 24 * 30 // 30 days — admin blocks are long-l
 // On every Block call it:
 //  1. Persists the entry to the blacklists table (durable, survives restarts).
 //  2. For USER blocks: marks all device_sessions rows revoked=true (audit trail).
-//  3. Publishes a BlacklistSyncEvent to the blacklist-sync Kafka topic so all
-//     Django instances update their L1 cache within one poll interval (~1 s).
+//  3. Publishes a BlacklistSyncEvent to the blacklist-sync Kafka topic so
+//     downstream services update their L1 cache within one poll interval (~1 s).
 //
 // On Unblock it removes the DB entry and publishes a "blacklist.unblock" event so
-// Django instances proactively evict from L1 cache; the 60-second TTL provides the
-// safety net if the Kafka event is missed.
+// downstream services proactively evict from L1 cache; the 60-second TTL provides
+// the safety net if the Kafka event is missed.
 type AdminBlacklistService struct {
 	repo              repository.GlobalBlacklistRepository
 	deviceSessionRepo repository.DeviceSessionRepository
@@ -49,10 +49,10 @@ func (s *AdminBlacklistService) Block(ctx context.Context, targetType repository
 	}
 
 	// For USER blocks, revoke all device_sessions rows so the audit table reflects
-	// the block immediately — independent of the Kafka fan-out to Django.
+	// the block immediately — independent of the Kafka fan-out to downstream services.
 	if targetType == repository.TargetTypeUser {
 		if err := s.deviceSessionRepo.RevokeAllDevices(ctx, targetValue); err != nil {
-			// Non-fatal: Kafka event still propagates the block to Django. Log but continue.
+			// Non-fatal: Kafka event still propagates the block downstream. Log but continue.
 			log.Printf("[WARN] admin blacklist: revoke device sessions kratosID=%s: %v", targetValue, err)
 		}
 	}
@@ -69,13 +69,13 @@ func (s *AdminBlacklistService) Block(ctx context.Context, targetType repository
 	return nil
 }
 
-// Unblock removes a global block and notifies Django instances to evict from L1 cache.
+// Unblock removes a global block and publishes an event so downstream services evict from L1 cache.
 func (s *AdminBlacklistService) Unblock(ctx context.Context, targetType repository.BlacklistTargetType, targetValue string) error {
 	if err := s.repo.Remove(ctx, targetType, targetValue); err != nil {
 		return fmt.Errorf("admin blacklist: remove block: %w", err)
 	}
 
-	// Publish unblock so Django L1 caches are evicted proactively.
+	// Publish unblock so downstream L1 caches are evicted proactively.
 	// Even if the event is lost, the 60-second TTL ensures the entry expires naturally.
 	s.publisher.PublishBlacklistSync(kafkapkg.BlacklistSyncEvent{
 		EventType:   "blacklist.unblock",

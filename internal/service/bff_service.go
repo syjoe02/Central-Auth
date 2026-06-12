@@ -86,6 +86,7 @@ func (s *BFFService) Login(
 
 	tokens, err := s.hydra.IssueTokens(ctx, kratosID, deviceID, rememberMe)
 	if err != nil {
+		log.Printf("[BFF] Login IssueTokens error kratosID=%s: %v", kratosID, err)
 		return "", fmt.Errorf("bff login: issue tokens: %w", err)
 	}
 
