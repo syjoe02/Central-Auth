@@ -159,3 +159,56 @@ func TestAccountHandler_GetSessions_Returns200(t *testing.T) {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
 }
+
+func TestAccountHandler_GetSessions_Returns500OnServiceError(t *testing.T) {
+	svc := &mockAccountService{
+		getSessionsFn: func(_ context.Context, _ string) (*model.SessionsResponse, error) {
+			return nil, errors.New("redis unavailable")
+		},
+	}
+	r := setupAccountRouter(svc)
+	req := httptest.NewRequest(http.MethodGet, "/bff/account/sessions", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+}
+
+func TestAccountHandler_LogoutOtherDevices_Returns200OnSuccess(t *testing.T) {
+	called := false
+	svc := &mockAccountService{
+		logoutOtherFn: func(_ context.Context, _ string) error {
+			called = true
+			return nil
+		},
+	}
+	r := setupAccountRouter(svc)
+	req := httptest.NewRequest(http.MethodPost, "/bff/logout-other-devices", nil)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if !called {
+		t.Error("LogoutOtherDevices was not called")
+	}
+}
+
+func TestAccountHandler_LogoutDevices_Returns500OnServiceError(t *testing.T) {
+	svc := &mockAccountService{
+		logoutDevicesFn: func(_ context.Context, _ string, _ []string) error {
+			return errors.New("service unavailable")
+		},
+	}
+	r := setupAccountRouter(svc)
+	body, _ := json.Marshal(model.LogoutDevicesRequest{DeviceIDs: []string{"device-A"}})
+	req := httptest.NewRequest(http.MethodPost, "/bff/logout-devices", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+}
