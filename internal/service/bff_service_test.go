@@ -12,6 +12,7 @@ import (
 	"central-auth/internal/domain"
 	"central-auth/internal/hydra"
 	"central-auth/internal/kafka"
+	kratosclient "central-auth/internal/kratos"
 	"central-auth/internal/repository"
 	"central-auth/internal/service"
 	"central-auth/internal/session"
@@ -163,6 +164,43 @@ func (m *mockEventPublisher) PublishAuthSession(e kafka.AuthSessionEvent) {
 func (m *mockEventPublisher) PublishBlacklistSync(_ kafka.BlacklistSyncEvent) {}
 func (m *mockEventPublisher) Close(_ context.Context) error                   { return nil }
 
+// mockKratosClient is a no-op Kratos client for BFF service tests.
+// Individual tests may set deleteSessionFn / deleteSessionsFn to observe calls.
+type mockKratosClient struct {
+	getSessionIDByTokenFn func(ctx context.Context, token string) (string, error)
+	deleteSessionFn       func(ctx context.Context, sessionID string) error
+	deleteSessionsFn      func(ctx context.Context, identityID string) error
+}
+
+func (m *mockKratosClient) GetIdentity(_ context.Context, _ string) (*kratosclient.Identity, error) {
+	return nil, nil
+}
+func (m *mockKratosClient) GetIdentityByEmail(_ context.Context, _ string) (*kratosclient.Identity, error) {
+	return nil, nil
+}
+func (m *mockKratosClient) CreateIdentity(_ context.Context, _ string) (string, error) { return "", nil }
+func (m *mockKratosClient) GetSessionIDByToken(ctx context.Context, token string) (string, error) {
+	if m.getSessionIDByTokenFn != nil {
+		return m.getSessionIDByTokenFn(ctx, token)
+	}
+	return "", nil
+}
+func (m *mockKratosClient) DeleteSession(ctx context.Context, sessionID string) error {
+	if m.deleteSessionFn != nil {
+		return m.deleteSessionFn(ctx, sessionID)
+	}
+	return nil
+}
+func (m *mockKratosClient) DeleteSessions(ctx context.Context, identityID string) error {
+	if m.deleteSessionsFn != nil {
+		return m.deleteSessionsFn(ctx, identityID)
+	}
+	return nil
+}
+func (m *mockKratosClient) GetIdentityFull(ctx context.Context, id string) (*kratosclient.IdentityFull, error) {
+	return nil, nil // not used in BFF service tests
+}
+
 // compile-time interface checks
 var _ hydra.ClientI = (*mockHydra)(nil)
 var _ session.Store = (*mockSessionStore)(nil)
@@ -170,6 +208,7 @@ var _ blacklist.Blacklist = (*mockBlacklist)(nil)
 var _ repository.RedisRepo = (*bffMockRedisRepo)(nil)
 var _ repository.DeviceSessionRepository = (*bffMockDeviceSessionRepo)(nil)
 var _ kafka.EventPublisher = (*mockEventPublisher)(nil)
+var _ kratosclient.ClientI = (*mockKratosClient)(nil)
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -194,7 +233,7 @@ func bffGoodClaims(kratosID, deviceID string) *hydra.AccessTokenClaims {
 }
 
 func newBFFService(h *mockHydra, store session.Store, bl blacklist.Blacklist) *service.BFFService {
-	return service.NewBFFService(h, store, bl, &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), &kafka.NoopPublisher{})
+	return service.NewBFFService(h, &mockKratosClient{}, store, bl, &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), &kafka.NoopPublisher{})
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -212,7 +251,7 @@ func TestBFFService_Login_HappyPath(t *testing.T) {
 	}
 	svc := newBFFService(h, store, bl)
 
-	sessionID, err := svc.Login(context.Background(), "kratos1", "dev1", false, nil, nil)
+	sessionID, err := svc.Login(context.Background(), "kratos1", "dev1", false, "", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -238,7 +277,7 @@ func TestBFFService_Login_HydraFailure(t *testing.T) {
 		},
 	}, newMockStore(), newMockBlacklist())
 
-	_, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil)
+	_, err := svc.Login(context.Background(), "k1", "d1", false, "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error on Hydra failure")
 	}
@@ -529,7 +568,7 @@ func TestBFFService_Login_ValidateTokenFailure_ReturnsError(t *testing.T) {
 		},
 	}
 	svc := newBFFService(h, newMockStore(), newMockBlacklist())
-	_, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil)
+	_, err := svc.Login(context.Background(), "k1", "d1", false, "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error when ValidateAccessToken fails")
 	}
@@ -601,9 +640,9 @@ func TestBFFService_Login_PublishesAuthSessionEvent_WithJTI(t *testing.T) {
 			return bffGoodClaims("kratos1", "dev1"), nil
 		},
 	}
-	svc := service.NewBFFService(h, store, newMockBlacklist(), &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), pub)
+	svc := service.NewBFFService(h, &mockKratosClient{}, store, newMockBlacklist(), &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), pub)
 
-	_, err := svc.Login(context.Background(), "kratos1", "dev1", false, nil, nil)
+	_, err := svc.Login(context.Background(), "kratos1", "dev1", false, "", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -638,13 +677,140 @@ func TestBFFService_Login_NoSynchronousDeviceSessionSave(t *testing.T) {
 			return bffGoodClaims("k1", "d1"), nil
 		},
 	}
-	svc := service.NewBFFService(h, newMockStore(), newMockBlacklist(), &bffMockRedisRepo{}, repo, testCfg(), &kafka.NoopPublisher{})
+	svc := service.NewBFFService(h, &mockKratosClient{}, newMockStore(), newMockBlacklist(), &bffMockRedisRepo{}, repo, testCfg(), &kafka.NoopPublisher{})
 
-	if _, err := svc.Login(context.Background(), "k1", "d1", false, nil, nil); err != nil {
+	if _, err := svc.Login(context.Background(), "k1", "d1", false, "", nil, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if saveCalled {
 		t.Error("SaveDeviceSession must not be called synchronously in BFF Login (async via Kafka consumer)")
+	}
+}
+
+func TestBFFService_Logout_DeletesKratosSessionByID(t *testing.T) {
+	store := newMockStore()
+	sess := session.BFFSession{
+		SessionID:       "sess-kratos",
+		KratosID:        "k1",
+		DeviceID:        "d1",
+		KratosSessionID: "kratos-uuid-123",
+		ExpiresAt:       time.Now().Add(time.Hour),
+	}
+	store.Create(context.Background(), sess)
+
+	deletedID := ""
+	k := &mockKratosClient{
+		deleteSessionFn: func(_ context.Context, id string) error {
+			deletedID = id
+			return nil
+		},
+	}
+
+	svc := service.NewBFFService(
+		&mockHydra{revokeTokenFn: func(_ context.Context, _ string) error { return nil }},
+		k, store, newMockBlacklist(),
+		&bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), &kafka.NoopPublisher{},
+	)
+	if err := svc.Logout(context.Background(), "sess-kratos"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deletedID != "kratos-uuid-123" {
+		t.Errorf("expected Kratos session kratos-uuid-123 to be deleted, got %q", deletedID)
+	}
+}
+
+func TestBFFService_Logout_FallsBackToDeleteAllWhenNoKratosSessionID(t *testing.T) {
+	store := newMockStore()
+	sess := session.BFFSession{
+		SessionID: "sess-no-kratos-id",
+		KratosID:  "k1",
+		DeviceID:  "d1",
+		// KratosSessionID intentionally empty (pre-migration session)
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	store.Create(context.Background(), sess)
+
+	deleteAllCalled := ""
+	k := &mockKratosClient{
+		deleteSessionsFn: func(_ context.Context, identityID string) error {
+			deleteAllCalled = identityID
+			return nil
+		},
+	}
+
+	svc := service.NewBFFService(
+		&mockHydra{revokeTokenFn: func(_ context.Context, _ string) error { return nil }},
+		k, store, newMockBlacklist(),
+		&bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), &kafka.NoopPublisher{},
+	)
+	if err := svc.Logout(context.Background(), "sess-no-kratos-id"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteAllCalled != "k1" {
+		t.Errorf("expected DeleteSessions fallback for kratosID k1, got %q", deleteAllCalled)
+	}
+}
+
+func TestBFFService_LogoutAll_DeletesAllKratosSessions(t *testing.T) {
+	store := newMockStore()
+	for _, id := range []string{"sa", "sb"} {
+		store.Create(context.Background(), session.BFFSession{
+			SessionID: id, KratosID: "k1", DeviceID: "d" + id,
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+	}
+
+	deleteAllCalled := ""
+	k := &mockKratosClient{
+		deleteSessionsFn: func(_ context.Context, identityID string) error {
+			deleteAllCalled = identityID
+			return nil
+		},
+	}
+
+	svc := service.NewBFFService(
+		&mockHydra{revokeAllFn: func(_ context.Context, _ string) error { return nil }},
+		k, store, newMockBlacklist(),
+		&bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), &kafka.NoopPublisher{},
+	)
+	if err := svc.LogoutAll(context.Background(), "sa"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteAllCalled != "k1" {
+		t.Errorf("expected DeleteSessions called for kratosID k1, got %q", deleteAllCalled)
+	}
+}
+
+func TestBFFService_Login_StoresKratosSessionID(t *testing.T) {
+	store := newMockStore()
+	k := &mockKratosClient{
+		getSessionIDByTokenFn: func(_ context.Context, token string) (string, error) {
+			if token == "ory_token_abc" {
+				return "kratos-uuid-xyz", nil
+			}
+			return "", nil
+		},
+	}
+	h := &mockHydra{
+		issueTokensFn: func(_ context.Context, _, _ string, _ bool) (*hydra.TokenSet, error) {
+			return &hydra.TokenSet{AccessToken: "at", RefreshToken: "rt"}, nil
+		},
+		validateAccessTokenFn: func(_ context.Context, _ string) (*hydra.AccessTokenClaims, error) {
+			return bffGoodClaims("k1", "d1"), nil
+		},
+	}
+	svc := service.NewBFFService(h, k, store, newMockBlacklist(), &bffMockRedisRepo{}, &bffMockDeviceSessionRepo{}, testCfg(), &kafka.NoopPublisher{})
+
+	sessionID, err := svc.Login(context.Background(), "k1", "d1", false, "ory_token_abc", nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	sess, err := store.Get(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("session not found: %v", err)
+	}
+	if sess.KratosSessionID != "kratos-uuid-xyz" {
+		t.Errorf("expected KratosSessionID=kratos-uuid-xyz, got %q", sess.KratosSessionID)
 	}
 }
 
