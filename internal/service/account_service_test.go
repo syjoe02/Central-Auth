@@ -276,3 +276,132 @@ func TestAccountService_LogoutOtherDevices_KeepsCurrentDevice(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountService_GetSessions_SeparatesCurrentAndOtherDevices(t *testing.T) {
+	now := time.Now().UTC()
+	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/149.0.0.0"
+	bffMock := &accountMockBFF{
+		whoAmIFn: func(_ context.Context, _ string) (string, string, error) {
+			return "kratos-1", "device-current", nil
+		},
+	}
+	store := &accountMockStore{
+		sessions: []session.BFFSession{
+			{SessionID: "s1", KratosID: "kratos-1", DeviceID: "device-current"},
+			{SessionID: "s2", KratosID: "kratos-1", DeviceID: "device-other"},
+		},
+	}
+	deviceRepo := &accountMockDeviceRepo{
+		sessions: []domain.DeviceSession{
+			{DeviceID: "device-current", Revoked: false, UserAgent: &ua, LastUsedAt: &now},
+			{DeviceID: "device-other", Revoked: false, UserAgent: &ua, LastUsedAt: &now},
+		},
+	}
+
+	svc := service.NewAccountService(bffMock, nil, store, deviceRepo)
+	resp, err := svc.GetSessions(context.Background(), "session-1")
+	if err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	if resp.CurrentDevice == nil {
+		t.Fatal("expected CurrentDevice to be set")
+	}
+	if !resp.CurrentDevice.IsCurrent {
+		t.Error("CurrentDevice.IsCurrent must be true")
+	}
+	if resp.CurrentDevice.DeviceID != "device-current" {
+		t.Errorf("CurrentDevice.DeviceID = %q, want device-current", resp.CurrentDevice.DeviceID)
+	}
+	if len(resp.OtherDevices) != 1 {
+		t.Errorf("OtherDevices len = %d, want 1", len(resp.OtherDevices))
+	}
+	if resp.OtherDevices[0].IsCurrent {
+		t.Error("OtherDevices[0].IsCurrent must be false")
+	}
+}
+
+func TestAccountService_GetSessions_ExcludesRevokedDevices(t *testing.T) {
+	bffMock := &accountMockBFF{
+		whoAmIFn: func(_ context.Context, _ string) (string, string, error) {
+			return "kratos-1", "device-current", nil
+		},
+	}
+	store := &accountMockStore{
+		sessions: []session.BFFSession{
+			{SessionID: "s1", KratosID: "kratos-1", DeviceID: "device-current"},
+			{SessionID: "s2", KratosID: "kratos-1", DeviceID: "device-revoked"},
+		},
+	}
+	deviceRepo := &accountMockDeviceRepo{
+		sessions: []domain.DeviceSession{
+			{DeviceID: "device-current", Revoked: false},
+			{DeviceID: "device-revoked", Revoked: true},
+		},
+	}
+
+	svc := service.NewAccountService(bffMock, nil, store, deviceRepo)
+	resp, err := svc.GetSessions(context.Background(), "session-1")
+	if err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	if len(resp.OtherDevices) != 0 {
+		t.Errorf("expected no other devices after revocation, got %d", len(resp.OtherDevices))
+	}
+}
+
+func TestAccountService_GetSessions_ExcludesInactiveDevices(t *testing.T) {
+	bffMock := &accountMockBFF{
+		whoAmIFn: func(_ context.Context, _ string) (string, string, error) {
+			return "kratos-1", "device-current", nil
+		},
+	}
+	// Only device-current is in Redis (active BFF sessions)
+	store := &accountMockStore{
+		sessions: []session.BFFSession{
+			{SessionID: "s1", KratosID: "kratos-1", DeviceID: "device-current"},
+		},
+	}
+	// device-postgres-only exists in Postgres but not in Redis
+	deviceRepo := &accountMockDeviceRepo{
+		sessions: []domain.DeviceSession{
+			{DeviceID: "device-current", Revoked: false},
+			{DeviceID: "device-postgres-only", Revoked: false},
+		},
+	}
+
+	svc := service.NewAccountService(bffMock, nil, store, deviceRepo)
+	resp, err := svc.GetSessions(context.Background(), "session-1")
+	if err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	if len(resp.OtherDevices) != 0 {
+		t.Errorf("inactive device must not appear: OtherDevices = %v", resp.OtherDevices)
+	}
+}
+
+func TestAccountService_GetSessions_OtherDevicesIsEmptySliceNotNil(t *testing.T) {
+	bffMock := &accountMockBFF{
+		whoAmIFn: func(_ context.Context, _ string) (string, string, error) {
+			return "kratos-1", "device-current", nil
+		},
+	}
+	store := &accountMockStore{
+		sessions: []session.BFFSession{
+			{SessionID: "s1", KratosID: "kratos-1", DeviceID: "device-current"},
+		},
+	}
+	deviceRepo := &accountMockDeviceRepo{
+		sessions: []domain.DeviceSession{
+			{DeviceID: "device-current", Revoked: false},
+		},
+	}
+
+	svc := service.NewAccountService(bffMock, nil, store, deviceRepo)
+	resp, err := svc.GetSessions(context.Background(), "session-1")
+	if err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	if resp.OtherDevices == nil {
+		t.Error("OtherDevices must be an empty slice, not nil (nil serializes to JSON null)")
+	}
+}

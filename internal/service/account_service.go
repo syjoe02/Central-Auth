@@ -151,6 +151,9 @@ func (s *AccountService) LogoutDevices(ctx context.Context, sessionID string, de
 			requested[id] = struct{}{}
 		}
 	}
+	// If all requested device IDs were the current device, requested is empty
+	// and this is a no-op. This is intentional: callers cannot log out their
+	// own current session via this endpoint.
 
 	bffSessions, err := s.sessionStore.GetAllForUser(ctx, kratosID)
 	if err != nil {
