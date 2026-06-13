@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -16,6 +17,10 @@ func TestGetIdentityFull_ParsesTraitsAndCredentials(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/admin/identities/abc-123" {
 			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		q := r.URL.Query()
+		if !slices.Contains(q["include_credential"], "oidc") || !slices.Contains(q["include_credential"], "password") {
+			t.Errorf("missing include_credential params, got %v", q["include_credential"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
