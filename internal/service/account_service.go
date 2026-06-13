@@ -18,7 +18,14 @@ import (
 type AccountServiceI interface {
 	GetMe(ctx context.Context, sessionID string) (*model.AccountMeResponse, error)
 	GetSessions(ctx context.Context, sessionID string) (*model.SessionsResponse, error)
+	// LogoutDevices revokes the listed device IDs that belong to the current user.
+	// The current device is never revoked even if included in deviceIDs.
+	// Unrecognised or foreign device IDs are silently ignored.
+	// Individual logout failures are logged as warnings but do not abort the batch —
+	// this is best-effort: remaining devices are still revoked even if one fails.
 	LogoutDevices(ctx context.Context, sessionID string, deviceIDs []string) error
+	// LogoutOtherDevices revokes all sessions except the one making the request.
+	// Individual logout failures are logged as warnings but do not abort the batch.
 	LogoutOtherDevices(ctx context.Context, sessionID string) error
 }
 
@@ -165,7 +172,7 @@ func (s *AccountService) LogoutDevices(ctx context.Context, sessionID string, de
 			continue
 		}
 		if err := s.bff.Logout(ctx, bs.SessionID); err != nil {
-			log.Printf("[WARN] account: logout device %s session %s: %v", bs.DeviceID, bs.SessionID, err)
+			log.Printf("[WARN] account: best-effort logout failed for device %s session %s: %v", bs.DeviceID, bs.SessionID, err)
 		}
 	}
 
@@ -188,7 +195,7 @@ func (s *AccountService) LogoutOtherDevices(ctx context.Context, sessionID strin
 			continue
 		}
 		if err := s.bff.Logout(ctx, bs.SessionID); err != nil {
-			log.Printf("[WARN] account: logout other device %s session %s: %v", bs.DeviceID, bs.SessionID, err)
+			log.Printf("[WARN] account: best-effort logout failed for device %s session %s: %v", bs.DeviceID, bs.SessionID, err)
 		}
 	}
 
