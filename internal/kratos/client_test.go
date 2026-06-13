@@ -3,8 +3,10 @@ package kratos_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"central-auth/internal/kratos"
@@ -39,5 +41,32 @@ func TestGetIdentityFull_ParsesTraitsAndCredentials(t *testing.T) {
 	}
 	if _, ok := identity.Credentials["password"]; ok {
 		t.Error("expected credentials.password to be absent")
+	}
+}
+
+func TestGetIdentityFull_ErrorPaths(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantErrSub string
+	}{
+		{"not found", http.StatusNotFound, `{}`, "not found"},
+		{"server error", http.StatusInternalServerError, `{}`, "unexpected status 500"},
+		{"bad json", http.StatusOK, `{invalid`, "decode identity-full"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				fmt.Fprint(w, tc.body)
+			}))
+			defer srv.Close()
+			c := kratos.New(srv.URL, srv.URL)
+			_, err := c.GetIdentityFull(context.Background(), "abc-123")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("want error containing %q, got %v", tc.wantErrSub, err)
+			}
+		})
 	}
 }

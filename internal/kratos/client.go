@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -30,8 +31,7 @@ type Identity struct {
 // Credentials keys ("oidc", "password", etc.) indicate which login providers are
 // configured for this identity. Values are raw JSON — only key existence is checked.
 type IdentityFull struct {
-	ID          string                     `json:"id"`
-	Traits      json.RawMessage            `json:"traits"`
+	Identity
 	Credentials map[string]json.RawMessage `json:"credentials"`
 }
 
@@ -72,30 +72,37 @@ func New(adminURL, publicURL string) *Client {
 	}
 }
 
-// GetIdentity fetches an identity by its Kratos UUID from the Admin API.
-// Returns an error if the identity does not exist or if the Admin API is unavailable.
-func (c *Client) GetIdentity(ctx context.Context, identityID string) (*Identity, error) {
-	url := fmt.Sprintf("%s/admin/identities/%s", c.adminURL, identityID)
+// doAdminGet performs a GET request against the Kratos Admin API at the given path
+// and returns the raw response body. Callers are responsible for unmarshalling.
+func (c *Client) doAdminGet(ctx context.Context, path string) ([]byte, error) {
+	url := c.adminURL + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("kratos: build request: %w", err)
 	}
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("kratos: admin request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("kratos: identity %s not found", identityID)
+		return nil, fmt.Errorf("kratos: resource not found at %s", path)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kratos: unexpected status %d from admin/identities", resp.StatusCode)
+		return nil, fmt.Errorf("kratos: unexpected status %d from %s", resp.StatusCode, path)
 	}
+	return io.ReadAll(resp.Body)
+}
 
+// GetIdentity fetches an identity by its Kratos UUID from the Admin API.
+// Returns an error if the identity does not exist or if the Admin API is unavailable.
+func (c *Client) GetIdentity(ctx context.Context, identityID string) (*Identity, error) {
+	data, err := c.doAdminGet(ctx, fmt.Sprintf("/admin/identities/%s", identityID))
+	if err != nil {
+		return nil, err
+	}
 	var identity Identity
-	if err := json.NewDecoder(resp.Body).Decode(&identity); err != nil {
+	if err := json.Unmarshal(data, &identity); err != nil {
 		return nil, fmt.Errorf("kratos: decode identity response: %w", err)
 	}
 	return &identity, nil
@@ -104,27 +111,12 @@ func (c *Client) GetIdentity(ctx context.Context, identityID string) (*Identity,
 // GetIdentityFull fetches a Kratos identity including the credentials map.
 // Use this when you need to determine the user's login provider (oidc vs password).
 func (c *Client) GetIdentityFull(ctx context.Context, identityID string) (*IdentityFull, error) {
-	url := fmt.Sprintf("%s/admin/identities/%s", c.adminURL, identityID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	data, err := c.doAdminGet(ctx, fmt.Sprintf("/admin/identities/%s", identityID))
 	if err != nil {
-		return nil, fmt.Errorf("kratos: build request: %w", err)
+		return nil, err
 	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("kratos: admin request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("kratos: identity %s not found", identityID)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("kratos: unexpected status %d from admin/identities", resp.StatusCode)
-	}
-
 	var identity IdentityFull
-	if err := json.NewDecoder(resp.Body).Decode(&identity); err != nil {
+	if err := json.Unmarshal(data, &identity); err != nil {
 		return nil, fmt.Errorf("kratos: decode identity-full response: %w", err)
 	}
 	return &identity, nil
