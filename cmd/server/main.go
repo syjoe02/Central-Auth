@@ -208,7 +208,7 @@ func main() {
 	)
 
 	// ── BFF session layer ─────────────────────────────────────────────────────
-	bffService := service.NewBFFService(hydraClient, resilientSessionStore, resilientBlacklist, redisRepo, deviceSessionRepo, bffConfig, kafkaProducer)
+	bffService := service.NewBFFService(hydraClient, kratosAdminClient, resilientSessionStore, resilientBlacklist, redisRepo, deviceSessionRepo, bffConfig, kafkaProducer)
 
 	// ── Admin blacklist service ───────────────────────────────────────────────
 	adminBlacklistSvc := service.NewAdminBlacklistService(globalBlacklistRepo, deviceSessionRepo, kafkaProducer)
@@ -226,6 +226,8 @@ func main() {
 	// ── Handlers ──────────────────────────────────────────────────────────────
 	authHandler := handler.NewAuthHandler(authService)
 	bffHandler := handler.NewBFFHandler(bffService, bffConfig)
+	accountService := service.NewAccountService(bffService, kratosAdminClient, resilientSessionStore, deviceSessionRepo)
+	accountHandler := handler.NewAccountHandler(accountService)
 	adminHandler := handler.NewAdminHandler(hydraClient)
 	adminBlacklistHandler := handler.NewAdminBlacklistHandler(adminBlacklistSvc)
 
@@ -289,6 +291,10 @@ func main() {
 			protected.POST("/logout", bffHandler.Logout)
 			protected.POST("/logout-all", bffHandler.LogoutAll)
 			protected.GET("/whoami", bffHandler.WhoAmI)
+			protected.GET("/account/me", accountHandler.GetMe)
+			protected.GET("/account/sessions", accountHandler.GetSessions)
+			protected.POST("/logout-devices", accountHandler.LogoutDevices)
+			protected.POST("/logout-other-devices", accountHandler.LogoutOtherDevices)
 		}
 	}
 
