@@ -110,8 +110,11 @@ func (c *Client) GetIdentity(ctx context.Context, identityID string) (*Identity,
 
 // GetIdentityFull fetches a Kratos identity including the credentials map.
 // Use this when you need to determine the user's login provider (oidc vs password).
+// Note: include_credential query params are intentionally omitted — Kratos v0.13
+// already returns the credentials map on the base endpoint, and the params trigger
+// a credential-decryption code path that returns 500 when cipher secrets are present.
 func (c *Client) GetIdentityFull(ctx context.Context, identityID string) (*IdentityFull, error) {
-	data, err := c.doAdminGet(ctx, fmt.Sprintf("/admin/identities/%s?include_credential=oidc&include_credential=password", identityID))
+	data, err := c.doAdminGet(ctx, fmt.Sprintf("/admin/identities/%s", identityID))
 	if err != nil {
 		return nil, err
 	}
