@@ -12,6 +12,10 @@ type BFFSession struct {
 	SessionID         string    `json:"session_id"`
 	KratosID          string    `json:"kratos_id"`
 	DeviceID          string    `json:"device_id"`
+	// KratosSessionID is the Kratos session UUID captured at BFF login.
+	// Used to delete the specific Kratos session on logout rather than all sessions.
+	// Empty for sessions created before this field was introduced (fallback: delete all).
+	KratosSessionID   string    `json:"kratos_session_id,omitempty"`
 	HydraAccessToken  string    `json:"hydra_access_token"`
 	HydraRefreshToken string    `json:"hydra_refresh_token"`
 	// AccessTokenExp is parsed from the Hydra JWT exp claim and used to

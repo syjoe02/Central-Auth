@@ -56,7 +56,7 @@ func CSRFMiddleware(csrfSecret string, cookieSecure bool) gin.HandlerFunc {
 		// Issue a fresh CSRF token BEFORE calling c.Next() so the Set-Cookie
 		// header is included before Gin commits the response headers via c.JSON().
 		// Setting cookies after c.Next() is too late — headers are already sent.
-		token, err := newCSRFToken(secretKey, sessionID)
+		token, err := NewCSRFToken(secretKey, sessionID)
 		if err != nil {
 			log.Printf("[ERROR] CSRF: failed to generate token: %v", err)
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -89,10 +89,10 @@ func sessionIDFromContext(c *gin.Context) string {
 	return id
 }
 
-// newCSRFToken generates an HMAC-bound CSRF token.
+// NewCSRFToken generates an HMAC-bound CSRF token for the given session.
 // Returns an error if crypto/rand is unavailable; callers must handle this
 // as a hard failure rather than falling back to a deterministic value.
-func newCSRFToken(secret []byte, sessionID string) (string, error) {
+func NewCSRFToken(secret []byte, sessionID string) (string, error) {
 	b := make([]byte, csrfRandBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err

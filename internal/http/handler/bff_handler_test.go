@@ -21,15 +21,15 @@ import (
 // ── mock BFF service ──────────────────────────────────────────────────────────
 
 type mockBFFService struct {
-	loginFn          func(ctx context.Context, kratosID, deviceID string, rememberMe bool, ua, ip *string) (string, error)
+	loginFn          func(ctx context.Context, kratosID, deviceID string, rememberMe bool, kratosToken string, ua, ip *string) (string, error)
 	logoutFn         func(ctx context.Context, sessionID string) error
 	logoutAllFn      func(ctx context.Context, sessionID string) error
 	resolveSessionFn func(ctx context.Context, sessionID string) (string, string, string, error)
 	whoAmIFn         func(ctx context.Context, sessionID string) (string, string, error)
 }
 
-func (m *mockBFFService) Login(ctx context.Context, k, d string, r bool, ua, ip *string) (string, error) {
-	return m.loginFn(ctx, k, d, r, ua, ip)
+func (m *mockBFFService) Login(ctx context.Context, k, d string, r bool, kt string, ua, ip *string) (string, error) {
+	return m.loginFn(ctx, k, d, r, kt, ua, ip)
 }
 func (m *mockBFFService) Logout(ctx context.Context, id string) error    { return m.logoutFn(ctx, id) }
 func (m *mockBFFService) LogoutAll(ctx context.Context, id string) error { return m.logoutAllFn(ctx, id) }
@@ -75,7 +75,7 @@ func setupRouter(svc service.BFFServiceI) *gin.Engine {
 
 func TestLogin_SetsCookieOnSuccess(t *testing.T) {
 	svc := &mockBFFService{
-		loginFn: func(_ context.Context, _, _ string, _ bool, _, _ *string) (string, error) {
+		loginFn: func(_ context.Context, _, _ string, _ bool, _ string, _, _ *string) (string, error) {
 			return strings.Repeat("a", 64), nil
 		},
 	}
@@ -139,7 +139,7 @@ func TestLogin_Returns400_OnMissingFields(t *testing.T) {
 
 func TestLogin_Returns500_OnServiceError(t *testing.T) {
 	svc := &mockBFFService{
-		loginFn: func(_ context.Context, _, _ string, _ bool, _, _ *string) (string, error) {
+		loginFn: func(_ context.Context, _, _ string, _ bool, _ string, _, _ *string) (string, error) {
 			return "", errors.New("internal error")
 		},
 	}

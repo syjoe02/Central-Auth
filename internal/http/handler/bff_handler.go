@@ -7,13 +7,17 @@ import (
 	"time"
 
 	"central-auth/internal/config"
+	"central-auth/internal/http/middleware"
 	"central-auth/internal/model"
 	"central-auth/internal/service"
 
 	"github.com/gin-gonic/gin"
 )
 
-const bffCookieName = "__session"
+const (
+	bffCookieName     = "__session"
+	bffCSRFCookieName = "__csrf"
+)
 
 // BFFHandler handles browser-facing BFF endpoints.
 // It never returns Hydra tokens in response bodies; the browser only ever
@@ -42,7 +46,12 @@ func (h *BFFHandler) Login(c *gin.Context) {
 	ua := c.GetHeader("User-Agent")
 	ip := c.ClientIP()
 
-	sessionID, err := h.bffService.Login(c.Request.Context(), req.KratosID, req.DeviceID, req.RememberMe, &ua, &ip)
+	// Extract the Kratos session token (best-effort; empty if not present).
+	// Passed to the service to capture the Kratos session UUID for targeted
+	// revocation on logout.
+	kratosToken, _ := c.Cookie("ory_kratos_session")
+
+	sessionID, err := h.bffService.Login(c.Request.Context(), req.KratosID, req.DeviceID, req.RememberMe, kratosToken, &ua, &ip)
 	if err != nil {
 		// Log the internal error for diagnostics, but do not expose details to the browser.
 		log.Printf("[BFF] Login error kratosID=%s: %v", req.KratosID, err)
@@ -60,6 +69,23 @@ func (h *BFFHandler) Login(c *gin.Context) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
+
+	csrfToken, err := middleware.NewCSRFToken([]byte(h.cfg.CSRFSecret), sessionID)
+	if err != nil {
+		log.Printf("[BFF] Login: failed to generate CSRF token sessionID=%s: %v", sessionID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "login failed"})
+		return
+	}
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     bffCSRFCookieName,
+		Value:    csrfToken,
+		Path:     "/",
+		Secure:   h.cfg.CookieSecure,
+		HttpOnly: false, // Must be readable by JS to echo in X-CSRF-Token header.
+		SameSite: http.SameSiteStrictMode,
+	})
+	log.Printf("[DEBUG][BFF] Login: issued __csrf for sessionID=%s", sessionID)
+
 	c.JSON(http.StatusOK, model.BFFStatusResponse{Status: "authenticated"})
 }
 
@@ -119,7 +145,7 @@ func bffSessionID(c *gin.Context) string {
 	return id
 }
 
-// clearBFFCookie instructs the browser to delete the session cookie immediately.
+// clearBFFCookie instructs the browser to delete the session, CSRF, and Kratos session cookies.
 func clearBFFCookie(c *gin.Context, cfg config.BFFConfig) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     bffCookieName,
@@ -132,4 +158,28 @@ func clearBFFCookie(c *gin.Context, cfg config.BFFConfig) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     bffCSRFCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		Secure:   cfg.CookieSecure,
+		HttpOnly: false,
+		SameSite: http.SameSiteStrictMode,
+	})
+	// Clear the Kratos session cookie. The session was already invalidated server-side
+	// via the Kratos Admin API; this ensures the browser also drops the cookie.
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "ory_kratos_session",
+		Value:    "",
+		Path:     "/",
+		Domain:   cfg.CookieDomain,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+		Secure:   cfg.CookieSecure,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	log.Printf("[DEBUG][BFF] Logout: cleared __session, __csrf, and ory_kratos_session cookies")
 }
