@@ -137,14 +137,14 @@ func main() {
 	// ── Repositories ─────────────────────────────────────────────────────────
 	blacklistPgRepo := repository.NewPostgresBlacklistRepository(pgPool)
 
-	rawRedisRepo    := repository.NewRedisRepository(rdb)
+	rawRedisRepo := repository.NewRedisRepository(rdb)
 	rawSessionStore := session.NewRedisStore(rdb, bffConfig.SessionTTL)
-	rawBlacklist    := blacklist.NewRedisBlacklist(rdb)
+	rawBlacklist := blacklist.NewRedisBlacklist(rdb)
 
-	resilientRedisRepo    := resilience.NewResilientRedisRepo(rawRedisRepo, cb, l1Cache)
+	resilientRedisRepo := resilience.NewResilientRedisRepo(rawRedisRepo, cb, l1Cache)
 	resilientSessionStore := resilience.NewResilientSessionStore(rawSessionStore, cb, l1Cache)
-	resilientBlacklist    := resilience.NewResilientBlacklist(rawBlacklist, cb, l1Cache, blacklistPgRepo)
-	idempotencyCache      := resilience.NewResilientIdempotencyCache(rdb, cb)
+	resilientBlacklist := resilience.NewResilientBlacklist(rawBlacklist, cb, l1Cache, blacklistPgRepo)
+	idempotencyCache := resilience.NewResilientIdempotencyCache(rdb, cb)
 
 	// Background blacklist sync — when the circuit is OPEN, periodically bulk-loads
 	// all active blacklisted JTIs from PostgreSQL into the L1 cache.
@@ -160,6 +160,7 @@ func main() {
 	deviceSessionRepo := repository.NewInstrumentedDeviceSessionRepository(
 		repository.NewPostgresDeviceSessionRepository(pgPool),
 	)
+	globalBlacklistRepo := repository.NewPostgresGlobalBlacklistRepository(pgPool)
 
 	// ── Ory clients ──────────────────────────────────────────────────────────
 	hydraClient := hydraclient.New(
@@ -207,14 +208,17 @@ func main() {
 	)
 
 	// ── BFF session layer ─────────────────────────────────────────────────────
-	bffService := service.NewBFFService(hydraClient, resilientSessionStore, resilientBlacklist, redisRepo, deviceSessionRepo, bffConfig, kafkaProducer)
+	bffService := service.NewBFFService(hydraClient, kratosAdminClient, resilientSessionStore, resilientBlacklist, redisRepo, deviceSessionRepo, bffConfig, kafkaProducer)
 
-	// ── Proxy config (Django API gateway) ────────────────────────────────────
+	// ── Admin blacklist service ───────────────────────────────────────────────
+	adminBlacklistSvc := service.NewAdminBlacklistService(globalBlacklistRepo, deviceSessionRepo, kafkaProducer)
+
+	// ── Proxy config (Kotlin API gateway) ────────────────────────────────────
 	proxyConfig, err := config.LoadProxyConfig()
 	if err != nil {
 		log.Fatalf("[FATAL] proxy config: %v", err)
 	}
-	proxyHandler, err := handler.NewProxyHandler(proxyConfig.DjangoURL, proxyConfig.DialTimeout, hydraClient)
+	proxyHandler, err := handler.NewProxyHandler(proxyConfig.KotlinURL, proxyConfig.DialTimeout, proxyConfig.KotlinServiceKey)
 	if err != nil {
 		log.Fatalf("[FATAL] proxy handler init: %v", err)
 	}
@@ -222,7 +226,10 @@ func main() {
 	// ── Handlers ──────────────────────────────────────────────────────────────
 	authHandler := handler.NewAuthHandler(authService)
 	bffHandler := handler.NewBFFHandler(bffService, bffConfig)
+	accountService := service.NewAccountService(bffService, kratosAdminClient, resilientSessionStore, deviceSessionRepo)
+	accountHandler := handler.NewAccountHandler(accountService)
 	adminHandler := handler.NewAdminHandler(hydraClient)
+	adminBlacklistHandler := handler.NewAdminBlacklistHandler(adminBlacklistSvc)
 
 	// ── CORS origins (fail-fast in production if unset/wildcard) ─────────────
 	corsOrigins := middleware.LoadCORSOrigins(serverConfig.AppEnv)
@@ -244,18 +251,29 @@ func main() {
 	})
 	r.Use(middleware.KafkaAccessLogMiddleware(kafkaProducer))
 	r.Use(middleware.PrometheusMiddleware())
+	// CORS must be registered at the router level, not on individual groups.
+	// Gin only runs group middleware when a route matches; OPTIONS preflights
+	// never match a POST/GET route, so group-level CORS never fires for them.
+	// A router-level middleware runs unconditionally and handles all preflights.
+	r.Use(middleware.CORSMiddleware(corsOrigins))
 
-	// ── S2S routes (existing Django integration, unchanged) ───────────────────
+	// ── S2S routes (service-to-service only, X-Service-Key required) ──────────
 	auth := r.Group("/auth")
 	auth.Use(middleware.ServiceAuthMiddleware(serverConfig.ServiceAPIKey))
 	{
-		auth.POST("/signup", authHandler.Signup) // no rate limit — protected by X-Service-Key
-		auth.POST("/login", middleware.RateLimitMiddleware(), authHandler.Login)
 		auth.POST("/refresh", middleware.RateLimitMiddleware(), authHandler.Refresh)
 		auth.POST("/logout", authHandler.Logout)
 		auth.POST("/logout-all", authHandler.LogoutAll)
 		auth.POST("/verify", authHandler.Verify)
 		auth.POST("/google/login", authHandler.GoogleLogin)
+	}
+
+	// ── Browser-facing auth routes (no service key, rate-limited) ─────────────
+	// Signup is browser-callable: no X-Service-Key required.
+	pubAuth := r.Group("/auth")
+	pubAuth.Use(middleware.RateLimitMiddleware())
+	{
+		pubAuth.POST("/signup", authHandler.Signup)
 	}
 
 	// ── BFF routes (browser cookie-based) ─────────────────────────────────────
@@ -268,22 +286,28 @@ func main() {
 		// All other BFF routes require a valid __session cookie + CSRF token.
 		protected := bff.Group("")
 		protected.Use(middleware.BFFSessionMiddleware())
-		protected.Use(middleware.CSRFMiddleware(bffConfig.CSRFSecret))
+		protected.Use(middleware.CSRFMiddleware(bffConfig.CSRFSecret, bffConfig.CookieSecure))
 		{
 			protected.POST("/logout", bffHandler.Logout)
 			protected.POST("/logout-all", bffHandler.LogoutAll)
 			protected.GET("/whoami", bffHandler.WhoAmI)
+			protected.GET("/account/me", accountHandler.GetMe)
+			protected.GET("/account/sessions", accountHandler.GetSessions)
+			protected.POST("/logout-devices", accountHandler.LogoutDevices)
+			protected.POST("/logout-other-devices", accountHandler.LogoutOtherDevices)
 		}
 	}
 
-	// ── Django API proxy (/api/* → Django, JWT validated at the edge) ────────
+	// ── Kotlin API proxy (/api/* → backendKotlin, JWT validated at the edge) ────────
 	// Auth-free paths (/api/auth/*) are forwarded without token validation so
-	// Django can handle login/signup/refresh/logout natively.
-	// All other /api/* paths require a valid Hydra access token (read from the
-	// Authorization: Bearer header or the access_token httpOnly cookie).
+	// the backend can handle login/signup/refresh/logout natively.
+	// All other /api/* paths require a valid Hydra access token. Browser callers
+	// use the __session cookie (resolved to Bearer by BFFAPIBridgeMiddleware);
+	// S2S callers supply Authorization: Bearer directly.
 	api := r.Group("/api")
 	api.Use(middleware.CORSMiddleware(corsOrigins))
 	api.Use(middleware.RateLimitMiddleware())
+	api.Use(middleware.BFFAPIBridgeMiddleware(bffService))
 	api.Any("/*path", proxyHandler.Handle)
 
 	// ── Admin routes (X-Service-Key protected) ────────────────────────────────
@@ -291,12 +315,18 @@ func main() {
 	admin.Use(middleware.ServiceAuthMiddleware(serverConfig.ServiceAPIKey))
 	{
 		admin.POST("/jwks/refresh", adminHandler.RefreshJWKS)
+		admin.POST("/blacklist/block", adminBlacklistHandler.Block)
+		admin.DELETE("/blacklist/block", adminBlacklistHandler.Unblock)
 	}
 
-	// ── gRPC server (8-stage interceptor chain) ──────────────────────────────
+	// ── gRPC server (9-stage interceptor chain) ──────────────────────────────
 	// Interceptor order (outermost → innermost):
 	//   Recovery → Prometheus → RequestID → Logging →
-	//   ServiceAuth → KafkaAccessLog → RateLimit → Idempotency
+	//   ServiceAuth → KafkaAccessLog → RateLimit → RateLimitMethods → Idempotency
+	//
+	// RateLimitMethods applies tighter per-method limits on Logout and LogoutAll
+	// because they are expensive (Redis pipeline + Hydra revocation) and must be
+	// protected against bulk-revocation abuse independently of the global limit.
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			grpcinterceptor.Recovery(),
@@ -306,6 +336,10 @@ func main() {
 			grpcinterceptor.ServiceAuth(serverConfig.ServiceAPIKey),
 			grpcinterceptor.KafkaAccessLog(kafkaProducer),
 			grpcinterceptor.RateLimit(serverConfig.RateLimitRequestsPerMin),
+			grpcinterceptor.RateLimitMethods(map[string]int{
+				"/auth.v1.AuthService/Logout":    10,
+				"/auth.v1.AuthService/LogoutAll": 5,
+			}),
 			grpcinterceptor.Idempotency(idempotencyCache),
 		),
 	)
@@ -407,8 +441,8 @@ func main() {
 		httpWg.Wait() // H-3: no more Publish calls possible after this point
 
 		// ── Phase 1.5: stop background goroutines ────────────────────────────
-		bgSyncCancel()    // stop blacklist background sync
-		consumerCancel()  // stop device-session Kafka consumer
+		bgSyncCancel()   // stop blacklist background sync
+		consumerCancel() // stop device-session Kafka consumer
 		if deviceSessionConsumer != nil {
 			<-deviceSessionConsumer.RunDone()
 			if err := deviceSessionConsumer.Close(); err != nil {

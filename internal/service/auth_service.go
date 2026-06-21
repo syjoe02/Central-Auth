@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	RefreshTTLShort = time.Hour * 24 * 7  // 7 days (default)
-	RefreshTTLLong  = time.Hour * 24 * 30 // 30 days (remember_me)
+	RefreshTTLShort    = time.Hour * 24 * 7  // 7 days (default)
+	RefreshTTLLong     = time.Hour * 24 * 30 // 30 days (remember_me)
+	accessTokenTTL     = time.Minute * 15    // must match Hydra TTL_ACCESS_TOKEN
+	blacklistSyncExtra = time.Minute * 5     // grace buffer added on top of accessTokenTTL
 )
 
 // ErrInvalidToken is returned by the service for token errors that should map
@@ -28,7 +30,7 @@ var ErrInvalidToken = errors.New("invalid or expired token")
 // ErrEmailConflict is returned by Signup when the email is already registered.
 var ErrEmailConflict = errors.New("email already registered")
 
-// ErrInvalidCredentials is returned by LoginWithPassword when the credentials are wrong.
+// ErrInvalidCredentials is returned by GoogleLogin when no identity with the given email exists.
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
 // ErrTokenRevoked is returned by VerifyToken when the token's device or user
@@ -46,12 +48,8 @@ type VerifyResult struct {
 // It is satisfied by both OryAuthService (real) and InstrumentedAuthService (metrics wrapper).
 type AuthServiceI interface {
 	// Login issues Hydra tokens for a pre-authenticated Kratos identity.
-	// The caller (e.g. Django) has already verified the user's credentials.
+	// The caller has already verified the user's credentials via Kratos.
 	Login(ctx context.Context, kratosID, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
-
-	// LoginWithPassword authenticates the user against Kratos, then issues Hydra tokens.
-	// This is the primary path used by the Django integration.
-	LoginWithPassword(ctx context.Context, email, password, deviceID string, rememberMe bool, userAgent, ip *string) (accessToken, refreshToken string, err error)
 
 	// Logout revokes the session identified by the given Hydra refresh token.
 	Logout(ctx context.Context, refreshToken string) error
@@ -66,10 +64,10 @@ type AuthServiceI interface {
 	// Fail-closed: any error (invalid signature, expired, JWKS unavailable) returns a non-nil error.
 	VerifyToken(ctx context.Context, accessToken string) (*VerifyResult, error)
 
-	// Signup creates a new Kratos identity with the given email and password.
-	// Returns the new Kratos identity UUID. Returns ErrEmailConflict if the
-	// email is already registered.
-	Signup(ctx context.Context, email, password string) (kratosID string, err error)
+	// Signup creates a new Kratos identity for the given email (no password credential).
+	// The identity is linked to Google OIDC on the user's first Google login.
+	// Returns the new Kratos identity UUID. Returns ErrEmailConflict if the email is already registered.
+	Signup(ctx context.Context, email string) (kratosID string, err error)
 
 	// GoogleLogin looks up the Kratos identity by email (already verified via OIDC)
 	// and issues Hydra tokens. Returns ErrInvalidCredentials if no identity exists.
@@ -232,6 +230,19 @@ func (s *OryAuthService) Logout(ctx context.Context, refreshToken string) error 
 		}
 	}
 
+	// Fan-out revocation to downstream services (backendKotlin) via Kafka.
+	// ExpiresAt = access token TTL + buffer; downstream services use this to set
+	// their Redis TTL instead of a fixed 60s, avoiding premature eviction.
+	expiresAt := time.Now().UTC().Add(accessTokenTTL + blacklistSyncExtra)
+	s.publisher.PublishBlacklistSync(kafkapkg.BlacklistSyncEvent{
+		EventType:   "blacklist.sync",
+		TargetType:  "DEVICE",
+		TargetValue: kratosID + ":" + deviceID,
+		Reason:      "user logout",
+		ExpiresAt:   expiresAt.Format(time.RFC3339Nano),
+		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
+	})
+
 	if err := s.redisRepo.LogoutDevice(ctx, kratosID, deviceID); err != nil {
 		log.Printf("[WARN] [%s] logout: Redis cleanup failed (non-fatal): %v", rid, err)
 	}
@@ -286,6 +297,16 @@ func (s *OryAuthService) LogoutAll(ctx context.Context, refreshToken string) err
 			log.Printf("[WARN] [%s] logout-all: blacklist degraded (ErrRedisUnavailable), user key written to PG fallback kratosID=%s", rid, maskID(kratosID))
 		}
 	}
+
+	expiresAt := time.Now().UTC().Add(accessTokenTTL + blacklistSyncExtra)
+	s.publisher.PublishBlacklistSync(kafkapkg.BlacklistSyncEvent{
+		EventType:   "blacklist.sync",
+		TargetType:  "USER",
+		TargetValue: kratosID,
+		Reason:      "user logout-all",
+		ExpiresAt:   expiresAt.Format(time.RFC3339Nano),
+		Timestamp:   time.Now().UTC().Format(time.RFC3339Nano),
+	})
 
 	if err := s.redisRepo.LogoutAll(ctx, kratosID); err != nil {
 		log.Printf("[WARN] [%s] logout-all: Redis cleanup failed (non-fatal): %v", rid, err)
@@ -396,36 +417,14 @@ func derefStr(s *string) string {
 	return *s
 }
 
-// LoginWithPassword authenticates the user via Kratos self-service, then issues Hydra tokens.
-// This is the primary path for the Django integration (email+password login).
-func (s *OryAuthService) LoginWithPassword(
-	ctx context.Context,
-	email, password, deviceID string,
-	rememberMe bool,
-	userAgent, ip *string,
-) (string, string, error) {
-	if s.kratosClient == nil {
-		return "", "", fmt.Errorf("login_with_password: Kratos client not configured")
-	}
-	kratosID, err := s.kratosClient.AuthenticatePassword(ctx, email, password)
-	if err != nil {
-		if errors.Is(err, kratos.ErrInvalidCredentials) {
-			return "", "", ErrInvalidCredentials
-		}
-		log.Printf("[ERROR] Kratos AuthenticatePassword failed: %v", err)
-		return "", "", fmt.Errorf("login_with_password: authenticate: %w", err)
-	}
-	return s.Login(ctx, kratosID, deviceID, rememberMe, userAgent, ip)
-}
-
-// Signup creates a new Kratos identity with the given email and password.
-// Returns the Kratos identity UUID on success. Returns ErrEmailConflict if the
-// email is already registered.
-func (s *OryAuthService) Signup(ctx context.Context, email, password string) (string, error) {
+// Signup creates a new Kratos identity for the given email with no password credential.
+// The identity is linked to Google OIDC automatically on the user's first Google login.
+// Returns the Kratos identity UUID on success. Returns ErrEmailConflict if the email is already registered.
+func (s *OryAuthService) Signup(ctx context.Context, email string) (string, error) {
 	if s.kratosClient == nil {
 		return "", fmt.Errorf("signup: Kratos client not configured")
 	}
-	id, err := s.kratosClient.CreateIdentity(ctx, email, password)
+	id, err := s.kratosClient.CreateIdentity(ctx, email)
 	if err != nil {
 		if errors.Is(err, kratos.ErrEmailConflict) {
 			return "", ErrEmailConflict

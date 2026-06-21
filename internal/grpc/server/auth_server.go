@@ -29,12 +29,13 @@ func New(svc service.AuthServiceI) *AuthServer {
 }
 
 // Signup creates a new identity. Does NOT issue tokens.
+// Only email is required; no password credential is set on the Kratos identity.
 func (s *AuthServer) Signup(ctx context.Context, req *authv1.SignupRequest) (*authv1.SignupResponse, error) {
-	if req.Email == "" || req.Password == "" {
-		return nil, status.Error(codes.InvalidArgument, "email and password are required")
+	if req.Email == "" {
+		return nil, status.Error(codes.InvalidArgument, "email is required")
 	}
 
-	kratosID, err := s.svc.Signup(ctx, req.Email, req.Password)
+	kratosID, err := s.svc.Signup(ctx, req.Email)
 	if err != nil {
 		return nil, domainToGRPCStatus(err)
 	}
@@ -55,12 +56,6 @@ func (s *AuthServer) Login(ctx context.Context, req *authv1.LoginRequest) (*auth
 	var err error
 
 	switch req.Method {
-	case authv1.LoginMethod_LOGIN_METHOD_PASSWORD:
-		if req.Email == "" || req.Password == "" {
-			return nil, status.Error(codes.InvalidArgument, "email and password are required for PASSWORD method")
-		}
-		access, refresh, err = s.svc.LoginWithPassword(ctx, req.Email, req.Password, req.DeviceId, req.RememberMe, ua, ip)
-
 	case authv1.LoginMethod_LOGIN_METHOD_KRATOS_ID:
 		if req.KratosId == "" {
 			return nil, status.Error(codes.InvalidArgument, "kratos_id is required for KRATOS_ID method")

@@ -20,7 +20,7 @@ type ResilienceConfig struct {
 func LoadResilienceConfig() ResilienceConfig {
 	return ResilienceConfig{
 		FailureThreshold: envInt("REDIS_CB_FAILURE_THRESHOLD", 5),
-		ProbeBaseSeconds: envInt("REDIS_CB_PROBE_BASE_SECONDS", 30),
+		ProbeBaseSeconds: envInt("REDIS_CB_PROBE_BASE_SECONDS", 60),
 		ProbeMaxSeconds:  envInt("REDIS_CB_PROBE_MAX_SECONDS", 300),
 		JitterPct:        envInt("REDIS_CB_JITTER_PCT", 15),
 	}

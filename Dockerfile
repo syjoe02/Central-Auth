@@ -8,9 +8,13 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o central-auth ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -o central-auth ./cmd/server
 
 FROM alpine:3.19
+
+RUN wget -qO /bin/grpc-health-probe \
+    https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.28/grpc_health_probe-linux-amd64 \
+    && chmod +x /bin/grpc-health-probe
 
 WORKDIR /app
 

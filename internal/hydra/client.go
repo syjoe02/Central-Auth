@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"sync"
@@ -72,10 +74,62 @@ type AccessTokenClaims struct {
 
 // DeviceID extracts device_id from the ext map.
 func (c *AccessTokenClaims) DeviceID() string {
+	return c.extString("device_id")
+}
+
+// Roles extracts the roles slice from the ext map.
+func (c *AccessTokenClaims) Roles() []string {
+	if c.Ext == nil {
+		return nil
+	}
+	raw, ok := c.Ext["roles"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// Permissions extracts the permissions slice from the ext map.
+func (c *AccessTokenClaims) Permissions() []string {
+	if c.Ext == nil {
+		return nil
+	}
+	raw, ok := c.Ext["permissions"]
+	if !ok {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func (c *AccessTokenClaims) extString(key string) string {
 	if c.Ext == nil {
 		return ""
 	}
-	if v, ok := c.Ext["device_id"].(string); ok {
+	if v, ok := c.Ext[key].(string); ok {
 		return v
 	}
 	return ""
@@ -280,18 +334,45 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 		return nil, fmt.Errorf("hydra: generate nonce: %w", err)
 	}
 
+	// PKCE: generate a code_verifier and derive code_challenge (S256 method).
+	// Hydra enforces PKCE for all clients; the verifier is sent with the token
+	// exchange in Step 6.
+	codeVerifier, err := randomBase64URL(32)
+	if err != nil {
+		return nil, fmt.Errorf("hydra: generate code verifier: %w", err)
+	}
+	h := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
+
+	// Use a per-call cookie jar so Hydra's CSRF cookie set in Step 1 is carried
+	// through Steps 3 and 5. The standard noRedirectClient has no jar, which
+	// causes Hydra to reject Step 3 with "No CSRF value available in session cookie".
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("hydra: create cookie jar: %w", err)
+	}
+	flowClient := &http.Client{
+		Timeout: c.noRedirectClient.Timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Jar: jar,
+	}
+
 	// ── Step 1: Initiate OAuth2 authorization flow ──────────────────────────
 	authParams := url.Values{
-		"response_type": {"code"},
-		"client_id":     {c.clientID},
-		"redirect_uri":  {c.redirectURI},
-		"scope":         {"openid offline_access email profile"},
-		"state":         {state},
-		"nonce":         {nonce},
+		"response_type":         {"code"},
+		"client_id":             {c.clientID},
+		"redirect_uri":          {c.redirectURI},
+		"scope":                 {"openid offline_access email profile"},
+		"state":                 {state},
+		"nonce":                 {nonce},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
 	}
 	authURL := c.publicURL + "/oauth2/auth?" + authParams.Encode()
 
-	resp1, err := c.noRedirectClient.Get(authURL)
+	resp1, err := flowClient.Get(authURL)
 	if err != nil {
 		return nil, fmt.Errorf("hydra: initiate auth flow: %w", err)
 	}
@@ -319,7 +400,7 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 	}
 
 	// ── Step 3: Follow redirect_to to reach consent challenge ───────────────
-	resp3, err := c.noRedirectClient.Get(redirectTo1)
+	resp3, err := flowClient.Get(redirectTo1)
 	if err != nil {
 		return nil, fmt.Errorf("hydra: follow login redirect: %w", err)
 	}
@@ -344,8 +425,17 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 		"remember":                    rememberMe,
 		"remember_for":                rememberFor,
 		"session": map[string]interface{}{
-			"access_token": map[string]string{"device_id": deviceID},
-			"id_token":     map[string]string{"device_id": deviceID},
+			// ext claims are embedded in the JWT by Hydra.
+			// roles / permissions default to ["user"] / [] until the identity
+			// management layer (Kratos metadata or a roles DB) provides real values.
+			"access_token": map[string]interface{}{
+				"device_id":   deviceID,
+				"roles":       []string{"user"},
+				"permissions": []string{},
+			},
+			"id_token": map[string]interface{}{
+				"device_id": deviceID,
+			},
 		},
 	}
 	redirectTo2, err := c.adminAccept(ctx, "/admin/oauth2/auth/requests/consent/accept?consent_challenge="+consentChallenge, consentAcceptBody)
@@ -354,7 +444,7 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 	}
 
 	// ── Step 5: Follow redirect_to to receive the authorization code ─────────
-	resp5, err := c.noRedirectClient.Get(redirectTo2)
+	resp5, err := flowClient.Get(redirectTo2)
 	if err != nil {
 		return nil, fmt.Errorf("hydra: follow consent redirect: %w", err)
 	}
@@ -370,7 +460,7 @@ func (c *Client) IssueTokens(ctx context.Context, kratosID, deviceID string, rem
 	}
 
 	// ── Step 6: Exchange code for tokens ────────────────────────────────────
-	return c.exchangeCode(ctx, code)
+	return c.exchangeCode(ctx, code, codeVerifier)
 }
 
 // RefreshToken exchanges a Hydra refresh token for a new access+refresh token pair.
@@ -537,13 +627,14 @@ func (c *Client) adminAccept(ctx context.Context, path string, body interface{})
 	return result.RedirectTo, nil
 }
 
-func (c *Client) exchangeCode(ctx context.Context, code string) (*TokenSet, error) {
+func (c *Client) exchangeCode(ctx context.Context, code, codeVerifier string) (*TokenSet, error) {
 	data := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
 		"redirect_uri":  {c.redirectURI},
 		"client_id":     {c.clientID},
 		"client_secret": {c.clientSecret},
+		"code_verifier": {codeVerifier},
 	}
 	return c.tokenRequest(ctx, data)
 }
@@ -700,4 +791,12 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x", b), nil
+}
+
+func randomBase64URL(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }

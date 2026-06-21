@@ -10,11 +10,12 @@ import (
 
 // KafkaConfig holds configuration for the Kafka access-log producer.
 type KafkaConfig struct {
-	Brokers      []string
-	Topic        string
-	ChannelSize  int
-	WriteTimeout time.Duration
-	IsProduction bool
+	Brokers            []string
+	Topic              string
+	BlacklistSyncTopic string
+	ChannelSize        int
+	WriteTimeout       time.Duration
+	IsProduction       bool
 }
 
 // LoadKafkaConfig reads Kafka configuration from environment variables.
@@ -40,6 +41,11 @@ func LoadKafkaConfig() KafkaConfig {
 		topic = "access-logs"
 	}
 
+	blacklistSyncTopic := os.Getenv("KAFKA_BLACKLIST_SYNC_TOPIC")
+	if blacklistSyncTopic == "" {
+		blacklistSyncTopic = "blacklist-sync"
+	}
+
 	channelSize := 4096
 	if v := os.Getenv("KAFKA_CHANNEL_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -57,10 +63,11 @@ func LoadKafkaConfig() KafkaConfig {
 	}
 
 	return KafkaConfig{
-		Brokers:      brokers,
-		Topic:        topic,
-		ChannelSize:  channelSize,
-		WriteTimeout: 5 * time.Second,
-		IsProduction: strings.EqualFold(os.Getenv("IS_PRODUCTION"), "true"),
+		Brokers:            brokers,
+		Topic:              topic,
+		BlacklistSyncTopic: blacklistSyncTopic,
+		ChannelSize:        channelSize,
+		WriteTimeout:       5 * time.Second,
+		IsProduction:       strings.EqualFold(os.Getenv("IS_PRODUCTION"), "true"),
 	}
 }

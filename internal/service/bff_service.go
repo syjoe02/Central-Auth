@@ -12,6 +12,7 @@ import (
 	"central-auth/internal/config"
 	"central-auth/internal/hydra"
 	kafkapkg "central-auth/internal/kafka"
+	kratosclient "central-auth/internal/kratos"
 	"central-auth/internal/metrics"
 	"central-auth/internal/repository"
 	"central-auth/internal/resilience"
@@ -30,7 +31,9 @@ var ErrSessionNotFound = errors.New("session not found or expired")
 //   - Storing Hydra tokens server-side and transparently refreshing them.
 //   - Fail-closed blacklist checks on every request.
 type BFFServiceI interface {
-	Login(ctx context.Context, kratosID, deviceID string, rememberMe bool, userAgent, ip *string) (sessionID string, err error)
+	// Login issues a BFF session. kratosSessionToken is the value of the
+	// ory_kratos_session cookie from the incoming request; pass "" if not available.
+	Login(ctx context.Context, kratosID, deviceID string, rememberMe bool, kratosSessionToken string, userAgent, ip *string) (sessionID string, err error)
 	Logout(ctx context.Context, sessionID string) error
 	LogoutAll(ctx context.Context, sessionID string) error
 	// ResolveSession validates the session, checks the blacklist, refreshes the
@@ -42,6 +45,7 @@ type BFFServiceI interface {
 // BFFService implements BFFServiceI.
 type BFFService struct {
 	hydra             hydra.ClientI
+	kratosClient      kratosclient.ClientI
 	sessionStore      session.Store
 	blacklist         blacklist.Blacklist
 	redisRepo         repository.RedisRepo
@@ -55,6 +59,7 @@ type BFFService struct {
 // Pass &kafka.NoopPublisher{} in tests or when Kafka is unavailable.
 func NewBFFService(
 	hydraClient hydra.ClientI,
+	kratosClient kratosclient.ClientI,
 	store session.Store,
 	bl blacklist.Blacklist,
 	redisRepo repository.RedisRepo,
@@ -64,6 +69,7 @@ func NewBFFService(
 ) *BFFService {
 	return &BFFService{
 		hydra:             hydraClient,
+		kratosClient:      kratosClient,
 		sessionStore:      store,
 		blacklist:         bl,
 		redisRepo:         redisRepo,
@@ -76,16 +82,22 @@ func NewBFFService(
 // Login issues Hydra tokens, stores them server-side, and returns an opaque sessionID.
 // The sessionID is the only credential returned to the caller; it is stored in an
 // HttpOnly cookie. Hydra tokens are never returned to the browser.
+// kratosSessionToken is the value of the ory_kratos_session cookie from the browser
+// request; it is used to capture the Kratos session UUID for targeted revocation on
+// logout. Pass "" when unavailable — the Kratos session ID will be empty and logout
+// will fall back to deleting all sessions for the identity.
 func (s *BFFService) Login(
 	ctx context.Context,
 	kratosID, deviceID string,
 	rememberMe bool,
+	kratosSessionToken string,
 	userAgent, ip *string,
 ) (string, error) {
 	log.Printf("[BFF] Login kratosID=%s device=%s", kratosID, deviceID)
 
 	tokens, err := s.hydra.IssueTokens(ctx, kratosID, deviceID, rememberMe)
 	if err != nil {
+		log.Printf("[BFF] Login IssueTokens error kratosID=%s: %v", kratosID, err)
 		return "", fmt.Errorf("bff login: issue tokens: %w", err)
 	}
 
@@ -102,6 +114,17 @@ func (s *BFFService) Login(
 	sessionID, err := randomSessionID()
 	if err != nil {
 		return "", fmt.Errorf("bff login: generate session id: %w", err)
+	}
+
+	// Resolve Kratos session UUID for targeted revocation on logout (best-effort).
+	var kratosSessionID string
+	if kratosSessionToken != "" {
+		id, lookupErr := s.kratosClient.GetSessionIDByToken(ctx, kratosSessionToken)
+		if lookupErr != nil {
+			log.Printf("[WARN] bff login: could not resolve Kratos session ID (non-fatal): %v", lookupErr)
+		} else {
+			kratosSessionID = id
+		}
 	}
 
 	now := time.Now()
@@ -121,6 +144,7 @@ func (s *BFFService) Login(
 		SessionID:         sessionID,
 		KratosID:          kratosID,
 		DeviceID:          deviceID,
+		KratosSessionID:   kratosSessionID,
 		HydraAccessToken:  tokens.AccessToken,
 		HydraRefreshToken: tokens.RefreshToken,
 		AccessTokenExp:    accessExp,
@@ -294,6 +318,19 @@ func (s *BFFService) Logout(ctx context.Context, sessionID string) error {
 		log.Printf("[WARN] bff logout: Hydra RevokeToken failed (non-fatal): %v", err)
 	}
 
+	// Invalidate the Kratos session so /sessions/whoami returns 401 after logout.
+	// If the Kratos session UUID was captured at login, delete it specifically.
+	// Otherwise fall back to deleting all sessions for the identity.
+	if sess.KratosSessionID != "" {
+		if err := s.kratosClient.DeleteSession(ctx, sess.KratosSessionID); err != nil {
+			log.Printf("[WARN] bff logout: Kratos DeleteSession failed (non-fatal): %v", err)
+		}
+	} else {
+		if err := s.kratosClient.DeleteSessions(ctx, sess.KratosID); err != nil {
+			log.Printf("[WARN] bff logout: Kratos DeleteSessions fallback failed (non-fatal): %v", err)
+		}
+	}
+
 	if err := s.sessionStore.Delete(ctx, sessionID); err != nil {
 		log.Printf("[WARN] bff logout: session delete failed (non-fatal): %v", err)
 	}
@@ -353,6 +390,12 @@ func (s *BFFService) LogoutAll(ctx context.Context, sessionID string) error {
 	if err := s.hydra.RevokeAllForSubject(ctx, kratosID); err != nil {
 		log.Printf("[ERROR] bff logout-all: RevokeAllForSubject failed: %v", err)
 		return fmt.Errorf("bff logout-all: revoke tokens: %w", err)
+	}
+
+	// Invalidate all Kratos sessions for this identity so every browser session
+	// is forced to re-authenticate through Kratos on the next whoami check.
+	if err := s.kratosClient.DeleteSessions(ctx, kratosID); err != nil {
+		log.Printf("[WARN] bff logout-all: Kratos DeleteSessions failed (non-fatal): %v", err)
 	}
 
 	if _, err := s.sessionStore.DeleteAllForUser(ctx, kratosID); err != nil {

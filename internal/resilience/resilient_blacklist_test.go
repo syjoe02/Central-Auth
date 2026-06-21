@@ -51,6 +51,19 @@ func (f *fakePgBlacklist) Add(_ context.Context, sessionID string, expiresAt tim
 
 func (f *fakePgBlacklist) DeleteExpired(_ context.Context) error { return nil }
 
+func (f *fakePgBlacklist) ListActive(_ context.Context) ([]repository.BlacklistEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := time.Now()
+	var out []repository.BlacklistEntry
+	for id, exp := range f.entries {
+		if exp.After(now) {
+			out = append(out, repository.BlacklistEntry{SessionID: id, ExpiresAt: exp})
+		}
+	}
+	return out, nil
+}
+
 var _ repository.BlacklistPgRepository = (*fakePgBlacklist)(nil)
 
 // failingPgBlacklist always returns an error for IsBlacklisted.
@@ -63,6 +76,9 @@ func (f *failingPgBlacklist) Add(_ context.Context, _ string, _ time.Time) error
 	return errors.New("pg: connection refused")
 }
 func (f *failingPgBlacklist) DeleteExpired(_ context.Context) error { return nil }
+func (f *failingPgBlacklist) ListActive(_ context.Context) ([]repository.BlacklistEntry, error) {
+	return nil, errors.New("pg: connection refused")
+}
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
